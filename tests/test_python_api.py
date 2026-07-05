@@ -43,3 +43,14 @@ def test_doctor(tmp_path: Path) -> None:
     text = agentledger.doctor(tmp_path)
     assert "AgentLedger" in text
     assert "agents:" in text
+
+
+def test_proxy_help() -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "agentledger", "proxy", "--help"],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    )
+    assert "--upstream" in result.stdout
+    assert "--record-bodies" in result.stdout

@@ -175,6 +175,17 @@ def open_dashboard(*, bind: str = "127.0.0.1:0", root: str | Path = ".") -> int:
     return int(_native.run_cli(["dashboard", "--bind", bind, "--root", str(root)]))
 
 
+def openai_proxy(
+    *,
+    upstream: str,
+    bind: str = "127.0.0.1:0",
+    root: str | Path = ".",
+    api_key_env: str | None = None,
+    record_bodies: bool = False,
+) -> None:
+    _native.start_proxy(bind, upstream, str(root), api_key_env, record_bodies)
+
+
 def doctor(root: str | Path = ".") -> str:
     return _native.doctor(str(root))
 
@@ -198,6 +209,7 @@ __all__ = [
     "export",
     "init",
     "open_dashboard",
+    "openai_proxy",
     "replay",
     "run",
 ]

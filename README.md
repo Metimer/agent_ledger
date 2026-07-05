@@ -18,9 +18,10 @@ Current MVP capabilities:
 - compare runs by task;
 - export the ledger as JSONL or CSV;
 - open a token-protected local dashboard on `127.0.0.1`;
-- use a Python API around the same native core.
+- use a Python API around the same native core;
+- run a loopback OpenAI-compatible proxy that records LLM call metrics in `.agentledger/llm_calls.ndjson`.
 
-Planned next layers are OpenAI-compatible proxy capture, exact LLM token/cost metrics, matrix benchmarks, replay, Parquet/DuckDB analytics and OTLP export.
+Planned next layers are streaming-first proxy replay, matrix benchmarks, Parquet/DuckDB analytics and OTLP export.
 
 ## Quickstart
 
@@ -29,6 +30,7 @@ agentledger init
 agentledger run --task smoke --agent custom --allow-dirty -- echo ok
 agentledger compare smoke
 agentledger export --format csv
+agentledger proxy --upstream http://127.0.0.1:11434/v1
 agentledger dashboard
 ```
 

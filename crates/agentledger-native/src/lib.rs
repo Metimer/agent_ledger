@@ -14,6 +14,8 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+mod proxy;
+
 const SCHEMA_VERSION: u32 = 1;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -314,6 +316,18 @@ enum Commands {
         #[arg(long, default_value = ".")]
         root: PathBuf,
     },
+    Proxy {
+        #[arg(long, default_value = "127.0.0.1:0")]
+        bind: String,
+        #[arg(long)]
+        upstream: String,
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long)]
+        api_key_env: Option<String>,
+        #[arg(long)]
+        record_bodies: bool,
+    },
     Export {
         #[arg(long, default_value = "jsonl")]
         format: String,
@@ -395,6 +409,26 @@ fn doctor(root: Option<String>) -> PyResult<String> {
 }
 
 #[pyfunction]
+fn start_proxy(
+    bind: String,
+    upstream: String,
+    root: Option<String>,
+    api_key_env: Option<String>,
+    record_bodies: Option<bool>,
+) -> PyResult<()> {
+    let root = root.unwrap_or_else(|| ".".to_string());
+    let api_key = api_key_env.and_then(|name| std::env::var(name).ok());
+    proxy::serve_proxy(
+        &bind,
+        &upstream,
+        Path::new(&root),
+        api_key,
+        record_bodies.unwrap_or(false),
+    )
+    .map_err(|err| to_py_err(Error::Capture(err)))
+}
+
+#[pyfunction]
 fn run_cli(argv: Vec<String>) -> PyResult<i32> {
     let args = std::iter::once("agentledger".to_string()).chain(argv);
     let cli = match Cli::try_parse_from(args) {
@@ -431,6 +465,7 @@ fn _native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compare_runs, m)?)?;
     m.add_function(wrap_pyfunction!(export_ledger, m)?)?;
     m.add_function(wrap_pyfunction!(doctor, m)?)?;
+    m.add_function(wrap_pyfunction!(start_proxy, m)?)?;
     m.add_function(wrap_pyfunction!(run_cli, m)?)?;
     Ok(())
 }
@@ -478,6 +513,17 @@ fn dispatch(cli: Cli) -> Result<()> {
         }
         Commands::Dashboard { bind, root } => {
             serve_dashboard(&bind, &root)?;
+        }
+        Commands::Proxy {
+            bind,
+            upstream,
+            root,
+            api_key_env,
+            record_bodies,
+        } => {
+            let api_key = api_key_env.and_then(|name| std::env::var(name).ok());
+            proxy::serve_proxy(&bind, &upstream, &root, api_key, record_bodies)
+                .map_err(Error::Capture)?;
         }
         Commands::Export {
             format,
