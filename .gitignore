@@ -1,0 +1,16 @@
+/target/
+/.venv/
+/dist/
+/build/
+/*.egg-info/
+/python/*.egg-info/
+/.pytest_cache/
+/__pycache__/
+/.ruff_cache/
+/.agentledger/
+/AgentLedger.toml
+*.pyc
+
+*.so
+__pycache__/
+*.py[cod]

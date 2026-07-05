@@ -1,0 +1,60 @@
+[build-system]
+requires = ["maturin>=1.8,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "agent-benchmark-ledger"
+version = "0.1.0"
+description = "Local-first benchmark ledger for coding agents and LLM providers"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{ name = "Metimer" }]
+keywords = [
+  "agents",
+  "benchmark",
+  "llm",
+  "observability",
+  "openai-compatible",
+  "tracing",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Rust",
+  "Topic :: Software Development :: Testing",
+  "Topic :: System :: Benchmark",
+]
+dependencies = []
+
+[project.optional-dependencies]
+analytics = ["pandas>=2.2", "pyarrow>=16"]
+dev = ["maturin>=1.8,<2.0", "pytest>=8.0", "pip-audit>=2.7"]
+
+[project.urls]
+Homepage = "https://github.com/Metimer/agent_ledger"
+Repository = "https://github.com/Metimer/agent_ledger"
+Issues = "https://github.com/Metimer/agent_ledger/issues"
+
+[project.scripts]
+agentledger = "agentledger.cli:main"
+
+[tool.maturin]
+bindings = "pyo3"
+module-name = "agentledger._native"
+python-source = "python"
+include = [
+  { path = "README.md", format = "sdist" },
+  { path = "LICENSE", format = "sdist" },
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["python"]
