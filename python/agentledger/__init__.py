@@ -55,16 +55,18 @@ class CompareReport:
 
     def to_markdown(self) -> str:
         rows = self.data.get("runs", [])
-        header = "| Run | Task | Agent | Status | Duration | Eval | LLM metrics |\n"
-        separator = "| --- | --- | --- | --- | ---: | --- | --- |\n"
+        header = "| Run | Task | Agent | Status | Duration | Eval | Tokens | LLM calls | LLM metrics |\n"
+        separator = "| --- | --- | --- | --- | ---: | --- | ---: | ---: | --- |\n"
         body = "".join(
-            "| {id} | {task} | {agent} | {status} | {duration_ms} ms | {eval_status} | {llm_metrics_precision} |\n".format(
+            "| {id} | {task} | {agent} | {status} | {duration_ms} ms | {eval_status} | {token_total} | {llm_call_count} | {llm_metrics_precision} |\n".format(
                 id=str(row["id"])[:8],
                 task=row["task"],
                 agent=row["agent"],
                 status=row["status"],
                 duration_ms=row["duration_ms"],
                 eval_status=row["eval_status"],
+                token_total=row.get("token_total") or 0,
+                llm_call_count=row.get("llm_call_count", 0),
                 llm_metrics_precision=row["llm_metrics_precision"],
             )
             for row in rows

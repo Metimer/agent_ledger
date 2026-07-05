@@ -4,7 +4,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -24,13 +24,14 @@ struct ProxyState {
     record_bodies: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct LlmCallRecord {
     record_type: &'static str,
     schema_version: u32,
     id: String,
     timestamp: String,
     endpoint: String,
+    run_id: Option<String>,
     upstream_base: String,
     model: Option<String>,
     status: u16,
@@ -42,7 +43,7 @@ struct LlmCallRecord {
     metrics: LlmMetrics,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct LlmMetrics {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
@@ -160,6 +161,7 @@ async fn forward_openai_endpoint(
 
     let record = build_record(
         endpoint,
+        extract_run_id(&headers),
         &state.upstream_base,
         status.as_u16(),
         duration_ms,
@@ -172,6 +174,15 @@ async fn forward_openai_endpoint(
     }
 
     response_from_upstream(status, &response_headers, response_bytes)
+}
+
+fn extract_run_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-agentledger-run-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn apply_forward_headers(
@@ -224,8 +235,10 @@ fn response_from_upstream(
     response
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_record(
     endpoint: &str,
+    run_id: Option<String>,
     upstream_base: &str,
     status: u16,
     duration_ms: u128,
@@ -257,6 +270,7 @@ fn build_record(
         id: Uuid::new_v4().to_string(),
         timestamp: now_rfc3339(),
         endpoint: endpoint.to_string(),
+        run_id,
         upstream_base: upstream_base.to_string(),
         model,
         status,

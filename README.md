@@ -34,6 +34,8 @@ agentledger proxy --upstream http://127.0.0.1:11434/v1
 agentledger dashboard
 ```
 
+When `agentledger run` launches a command, it injects `AGENTLEDGER_RUN_ID`, `AGENTLEDGER_ROOT`, and `AGENTLEDGER_PROXY_RUN_HEADER`. Clients that send the `x-agentledger-run-id` header through the proxy get their LLM calls aggregated into `agentledger compare`.
+
 Python:
 
 ```python

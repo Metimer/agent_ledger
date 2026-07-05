@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -23,15 +24,39 @@ def test_init_run_compare_export(tmp_path: Path) -> None:
     result = agentledger.run(
         task="smoke",
         agent="custom",
-        command=[sys.executable, "-c", "print('ok')"],
+        command=[sys.executable, "-c", "import os; print(os.environ['AGENTLEDGER_RUN_ID'])"],
         repo=tmp_path,
     )
 
     assert result.status == "passed"
-    assert result.data["stdout_preview"].strip() == "ok"
+    assert result.data["stdout_preview"].strip() == result.id
+
+    llm_calls = tmp_path / ".agentledger" / "llm_calls.ndjson"
+    llm_calls.write_text(
+        json.dumps(
+            {
+                "record_type": "llm_call",
+                "schema_version": 1,
+                "run_id": result.id,
+                "duration_ms": 1000,
+                "metrics": {
+                    "input_tokens": 7,
+                    "output_tokens": 3,
+                    "total_tokens": 10,
+                    "cost_usd": 0.001,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     report = agentledger.compare(task="smoke", root=tmp_path)
     assert report.run_count == 1
+    row = report.data["runs"][0]
+    assert row["token_total"] == 10
+    assert row["llm_call_count"] == 1
+    assert row["llm_metrics_precision"] == "exact"
     assert "| smoke |" in report.to_markdown()
 
     output = tmp_path / "runs.csv"

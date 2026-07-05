@@ -223,7 +223,7 @@ struct EvalRecord {
     stderr_preview: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct RunMetrics {
     llm_metrics_precision: String,
     token_input: Option<u64>,
@@ -258,6 +258,7 @@ struct RunSummary {
     cost_usd: Option<f64>,
     token_total: Option<u64>,
     llm_metrics_precision: String,
+    llm_call_count: u64,
 }
 
 #[derive(Parser, Debug)]
@@ -621,6 +622,12 @@ fn run_capture(
     let output = Command::new(&command[0])
         .args(&command[1..])
         .current_dir(&repo)
+        .env("AGENTLEDGER_RUN_ID", &run_id)
+        .env("AGENTLEDGER_ROOT", ledger_dir.to_string_lossy().to_string())
+        .env(
+            "AGENTLEDGER_PROXY_RUN_HEADER",
+            format!("x-agentledger-run-id: {run_id}"),
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -842,8 +849,117 @@ fn load_runs(root: &Path) -> Result<Vec<RunRecord>> {
     Ok(runs)
 }
 
+#[derive(Debug, Default)]
+struct LlmMetricAggregate {
+    call_count: u64,
+    duration_ms: u128,
+    metrics: RunMetrics,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmCallLine {
+    run_id: Option<String>,
+    duration_ms: Option<u128>,
+    metrics: LlmCallLineMetrics,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmCallLineMetrics {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+    cost_usd: Option<f64>,
+    ttft_ms: Option<u128>,
+}
+
+fn load_llm_metric_aggregates(root: &Path) -> Result<BTreeMap<String, LlmMetricAggregate>> {
+    let calls_path = root.join(".agentledger").join("llm_calls.ndjson");
+    if !calls_path.exists() {
+        return Ok(BTreeMap::new());
+    }
+
+    let file = File::open(calls_path)?;
+    let reader = BufReader::new(file);
+    let mut aggregates = BTreeMap::<String, LlmMetricAggregate>::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let call: LlmCallLine = serde_json::from_str(&line)?;
+        let Some(run_id) = call.run_id else {
+            continue;
+        };
+        let aggregate = aggregates.entry(run_id).or_default();
+        aggregate.call_count += 1;
+        aggregate.duration_ms += call.duration_ms.unwrap_or_default();
+        aggregate.metrics.llm_metrics_precision = "exact".to_string();
+        add_u64(
+            &mut aggregate.metrics.token_input,
+            call.metrics.input_tokens,
+        );
+        add_u64(
+            &mut aggregate.metrics.token_output,
+            call.metrics.output_tokens,
+        );
+        add_u64(
+            &mut aggregate.metrics.token_total,
+            call.metrics.total_tokens,
+        );
+        add_f64(&mut aggregate.metrics.cost_usd, call.metrics.cost_usd);
+        aggregate.metrics.ttft_ms = min_u128(aggregate.metrics.ttft_ms, call.metrics.ttft_ms);
+    }
+
+    for aggregate in aggregates.values_mut() {
+        if let Some(output_tokens) = aggregate.metrics.token_output {
+            if aggregate.duration_ms > 0 {
+                aggregate.metrics.output_tokens_per_second =
+                    Some(output_tokens as f64 / (aggregate.duration_ms as f64 / 1000.0));
+            }
+        }
+    }
+
+    Ok(aggregates)
+}
+
+fn merge_run_metrics(base: &RunMetrics, aggregate: Option<&LlmMetricAggregate>) -> RunMetrics {
+    let Some(aggregate) = aggregate else {
+        return base.clone();
+    };
+    let mut metrics = base.clone();
+    metrics.llm_metrics_precision = "exact".to_string();
+    metrics.token_input = aggregate.metrics.token_input;
+    metrics.token_output = aggregate.metrics.token_output;
+    metrics.token_total = aggregate.metrics.token_total;
+    metrics.cost_usd = aggregate.metrics.cost_usd;
+    metrics.ttft_ms = aggregate.metrics.ttft_ms;
+    metrics.output_tokens_per_second = aggregate.metrics.output_tokens_per_second;
+    metrics
+}
+
+fn add_u64(target: &mut Option<u64>, value: Option<u64>) {
+    if let Some(value) = value {
+        *target = Some(target.unwrap_or_default() + value);
+    }
+}
+
+fn add_f64(target: &mut Option<f64>, value: Option<f64>) {
+    if let Some(value) = value {
+        *target = Some(target.unwrap_or_default() + value);
+    }
+}
+
+fn min_u128(target: Option<u128>, value: Option<u128>) -> Option<u128> {
+    match (target, value) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (None, Some(value)) => Some(value),
+        (value, None) => value,
+    }
+}
+
 fn compare(task: Option<String>, root: &Path) -> Result<CompareReport> {
     let mut runs = load_runs(root)?;
+    let llm_aggregates = load_llm_metric_aggregates(root)?;
     if let Some(task) = &task {
         runs.retain(|run| &run.task == task);
     }
@@ -857,6 +973,8 @@ fn compare(task: Option<String>, root: &Path) -> Result<CompareReport> {
             } else {
                 "failed".to_string()
             };
+            let aggregate = llm_aggregates.get(&run.id);
+            let metrics = merge_run_metrics(&run.metrics, aggregate);
             RunSummary {
                 id: run.id,
                 task: run.task,
@@ -867,9 +985,10 @@ fn compare(task: Option<String>, root: &Path) -> Result<CompareReport> {
                 eval_status,
                 repo: run.repo,
                 started_at: run.started_at,
-                cost_usd: run.metrics.cost_usd,
-                token_total: run.metrics.token_total,
-                llm_metrics_precision: run.metrics.llm_metrics_precision,
+                cost_usd: metrics.cost_usd,
+                token_total: metrics.token_total,
+                llm_metrics_precision: metrics.llm_metrics_precision,
+                llm_call_count: aggregate.map_or(0, |aggregate| aggregate.call_count),
             }
         })
         .collect::<Vec<_>>();
