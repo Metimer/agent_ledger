@@ -1,0 +1,484 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgentLedger</title>
+<style>
+:root {
+  --surface-1: #fcfcfb;
+  --page: #f9f9f7;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --muted: #898781;
+  --grid: #e1e0d9;
+  --baseline: #c3c2b7;
+  --border: rgba(11,11,11,0.10);
+  --good: #0ca30c;
+  --good-text: #006300;
+  --critical: #d03b3b;
+  --warning: #fab219;
+  --s1: #2a78d6; --s2: #1baf7a; --s3: #eda100; --s4: #008300;
+  --s5: #4a3aa7; --s6: #e34948; --s7: #e87ba4; --s8: #eb6834;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface-1: #1a1a19;
+    --page: #0d0d0d;
+    --ink: #ffffff;
+    --ink-2: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --baseline: #383835;
+    --border: rgba(255,255,255,0.10);
+    --good-text: #0ca30c;
+    --s1: #3987e5; --s2: #199e70; --s3: #c98500; --s4: #008300;
+    --s5: #9085e9; --s6: #e66767; --s7: #d55181; --s8: #d95926;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--page); color: var(--ink);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 14px;
+}
+header {
+  display: flex; align-items: baseline; gap: 16px; padding: 16px 24px;
+  border-bottom: 1px solid var(--border);
+}
+header h1 { font-size: 18px; margin: 0; }
+header .sub { color: var(--muted); font-size: 12px; }
+nav { display: flex; gap: 4px; margin-left: auto; }
+nav button {
+  background: none; border: 1px solid transparent; border-radius: 6px;
+  padding: 6px 14px; font: inherit; color: var(--ink-2); cursor: pointer;
+}
+nav button:hover { background: var(--surface-1); }
+nav button.active { background: var(--surface-1); border-color: var(--border); color: var(--ink); font-weight: 600; }
+main { max-width: 1240px; margin: 0 auto; padding: 20px 24px 60px; }
+section { display: none; }
+section.active { display: block; }
+.filters { display: flex; gap: 10px; flex-wrap: wrap; margin: 0 0 16px; align-items: center; }
+.filters select, .filters input {
+  background: var(--surface-1); color: var(--ink); border: 1px solid var(--border);
+  border-radius: 6px; padding: 6px 10px; font: inherit;
+}
+.card {
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+  padding: 16px; margin-bottom: 16px;
+}
+.card h3 { margin: 0 0 4px; font-size: 13px; font-weight: 600; color: var(--ink-2); }
+.card .hint { color: var(--muted); font-size: 12px; margin-bottom: 10px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--grid); }
+th { color: var(--muted); font-weight: 600; cursor: pointer; user-select: none; white-space: nowrap; }
+th .dir { font-size: 10px; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+tbody tr:hover { background: color-mix(in srgb, var(--ink) 4%, transparent); cursor: pointer; }
+tbody tr.static:hover { background: none; cursor: default; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+.chip { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; }
+.chip::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.chip.passed::before { background: var(--good); }
+.chip.failed::before { background: var(--critical); }
+.chip.error::before { background: var(--warning); }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 16px; }
+.meta-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px 24px; }
+.meta-grid dt { color: var(--muted); font-size: 12px; }
+.meta-grid dd { margin: 2px 0 0; word-break: break-all; }
+pre {
+  background: var(--page); border: 1px solid var(--grid); border-radius: 8px;
+  padding: 12px; overflow: auto; max-height: 420px; font-size: 12px; white-space: pre-wrap;
+}
+.legend { display: flex; gap: 14px; flex-wrap: wrap; margin: 4px 0 10px; font-size: 12px; color: var(--ink-2); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+.empty { color: var(--muted); padding: 24px; text-align: center; }
+svg text { fill: var(--ink-2); font-size: 11px; font-family: inherit; }
+svg .val { fill: var(--ink); font-weight: 600; }
+svg .axis { stroke: var(--baseline); stroke-width: 1; }
+svg .gridline { stroke: var(--grid); stroke-width: 1; }
+#tooltip {
+  position: fixed; display: none; pointer-events: none; z-index: 10;
+  background: var(--ink); color: var(--page); border-radius: 6px;
+  padding: 6px 10px; font-size: 12px; max-width: 320px;
+}
+button.link { background: none; border: none; color: var(--s1); cursor: pointer; font: inherit; padding: 0; }
+.backlink { margin-bottom: 12px; display: inline-block; }
+</style>
+</head>
+<body>
+<header>
+  <h1>AgentLedger</h1>
+  <span class="sub" id="summary"></span>
+  <nav>
+    <button data-view="runs" class="active">Runs</button>
+    <button data-view="tasks">Tâches</button>
+    <button data-view="detail">Détail</button>
+    <button data-view="trends">Tendances</button>
+  </nav>
+</header>
+<main>
+  <section id="view-runs" class="active">
+    <div class="filters">
+      <select id="f-task"><option value="">Toutes les tâches</option></select>
+      <select id="f-agent"><option value="">Tous les agents</option></select>
+      <select id="f-status">
+        <option value="">Tous les statuts</option>
+        <option value="passed">passed</option>
+        <option value="failed">failed</option>
+      </select>
+      <span class="sub" id="runs-count"></span>
+    </div>
+    <div class="card" style="padding:0">
+      <table id="runs-table">
+        <thead><tr>
+          <th data-k="started_at">Date <span class="dir"></span></th>
+          <th data-k="task">Tâche <span class="dir"></span></th>
+          <th data-k="agent">Agent <span class="dir"></span></th>
+          <th data-k="status">Statut <span class="dir"></span></th>
+          <th class="num" data-k="duration_ms">Durée <span class="dir"></span></th>
+          <th class="num" data-k="ttft_ms">TTFT <span class="dir"></span></th>
+          <th class="num" data-k="token_total">Tokens <span class="dir"></span></th>
+          <th class="num" data-k="cost_usd">Coût <span class="dir"></span></th>
+          <th data-k="eval_status">Éval <span class="dir"></span></th>
+          <th class="num" data-k="llm_error_calls">Err. LLM <span class="dir"></span></th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="empty" id="runs-empty" style="display:none">Aucun run — lancez <code>agentledger run</code> ou <code>agentledger bench</code>.</div>
+    </div>
+  </section>
+
+  <section id="view-tasks">
+    <div class="filters">
+      <select id="t-task"></select>
+      <span class="sub">Comparaison des agents sur la tâche sélectionnée</span>
+    </div>
+    <div id="task-content"></div>
+  </section>
+
+  <section id="view-detail">
+    <div id="detail-content"><div class="empty">Sélectionnez un run dans l'onglet Runs.</div></div>
+  </section>
+
+  <section id="view-trends">
+    <div class="filters">
+      <select id="tr-task"><option value="">Toutes les tâches</option></select>
+    </div>
+    <div class="grid2" id="trends-content"></div>
+  </section>
+</main>
+<div id="tooltip"></div>
+
+<script>
+"use strict";
+const token = new URLSearchParams(location.search).get("token") || "";
+const SERIES = ["--s1","--s2","--s3","--s4","--s5","--s6","--s7","--s8"];
+let runs = [], tasks = [], agentSlots = new Map();
+let sortKey = "started_at", sortDir = -1;
+
+const $ = (sel) => document.querySelector(sel);
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fmtMs = (v) => v == null ? "–" : v >= 10000 ? (v/1000).toFixed(1) + " s" : Math.round(v).toLocaleString("fr-FR") + " ms";
+const fmtNum = (v) => v == null ? "–" : Math.round(v).toLocaleString("fr-FR");
+const fmtCost = (v) => v == null ? "–" : "$" + Number(v).toFixed(4);
+const fmtDate = (v) => (v || "").replace("T", " ").slice(0, 19);
+const seriesVar = (agent) => SERIES[agentSlots.get(agent) % SERIES.length] || "--s1";
+
+async function api(path, params = {}) {
+  const url = new URL(path, location.origin);
+  url.searchParams.set("token", token);
+  for (const [k, v] of Object.entries(params)) if (v) url.searchParams.set(k, v);
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+/* Couleur par identité d'agent : slots assignés une fois, dans l'ordre de
+   première apparition global — jamais réattribués par un filtre. */
+function assignSlots() {
+  agentSlots.clear();
+  for (const run of [...runs].sort((a, b) => (a.started_at || "").localeCompare(b.started_at || ""))) {
+    if (!agentSlots.has(run.agent)) agentSlots.set(run.agent, agentSlots.size);
+  }
+}
+
+/* ---------- tooltip ---------- */
+const tip = $("#tooltip");
+function bindTips(rootEl) {
+  rootEl.querySelectorAll("[data-tip]").forEach((el) => {
+    el.addEventListener("mousemove", (ev) => {
+      tip.innerHTML = el.dataset.tip;
+      tip.style.display = "block";
+      tip.style.left = Math.min(ev.clientX + 12, innerWidth - 340) + "px";
+      tip.style.top = (ev.clientY + 12) + "px";
+    });
+    el.addEventListener("mouseleave", () => { tip.style.display = "none"; });
+  });
+}
+
+/* ---------- graphes SVG ---------- */
+function hbarChart({ items, format }) {
+  // items: [{label, value, colorVar, tip}] — barres horizontales fines,
+  // extrémité arrondie 4px, labels directs, une seule échelle.
+  const width = 460, rowH = 26, labelW = 150, valueW = 74;
+  const height = items.length * rowH + 8;
+  const max = Math.max(...items.map((i) => i.value ?? 0), 1e-9);
+  const plotW = width - labelW - valueW;
+  let bars = "";
+  items.forEach((item, i) => {
+    const y = i * rowH + 6;
+    const w = item.value == null ? 0 : Math.max((item.value / max) * plotW, item.value > 0 ? 3 : 0);
+    bars += `<text x="${labelW - 8}" y="${y + 11}" text-anchor="end">${esc(item.label).slice(0, 26)}</text>`;
+    if (item.value != null) {
+      bars += `<rect x="${labelW}" y="${y}" width="${w}" height="14" rx="4"
+        fill="var(${item.colorVar})" data-tip="${esc(item.tip || "")}"></rect>`;
+      bars += `<text class="val" x="${labelW + w + 8}" y="${y + 11}">${format(item.value)}</text>`;
+    } else {
+      bars += `<text x="${labelW}" y="${y + 11}">–</text>`;
+    }
+  });
+  return `<svg viewBox="0 0 ${width} ${height}" width="100%" style="max-width:${width}px">
+    <line class="axis" x1="${labelW}" y1="0" x2="${labelW}" y2="${height}"></line>${bars}</svg>`;
+}
+
+function lineChart({ points, format, colorVar = "--s1" }) {
+  // points: [{x: "2026-07-11", y: number, tip}] — série unique : le titre de la
+  // carte nomme la série, pas de légende nécessaire.
+  const width = 460, height = 160, padL = 46, padR = 12, padT = 10, padB = 24;
+  if (!points.length) return `<div class="empty">Aucune donnée</div>`;
+  const ys = points.map((p) => p.y ?? 0);
+  const max = Math.max(...ys, 1e-9);
+  const plotW = width - padL - padR, plotH = height - padT - padB;
+  const px = (i) => padL + (points.length === 1 ? plotW / 2 : (i / (points.length - 1)) * plotW);
+  const py = (v) => padT + plotH - (v / max) * plotH;
+  const path = points.map((p, i) => `${i ? "L" : "M"}${px(i).toFixed(1)},${py(p.y ?? 0).toFixed(1)}`).join(" ");
+  const gridY = [0.5, 1].map((f) => {
+    const y = py(max * f);
+    return `<line class="gridline" x1="${padL}" y1="${y}" x2="${width - padR}" y2="${y}"></line>
+      <text x="${padL - 6}" y="${y + 4}" text-anchor="end">${format(max * f)}</text>`;
+  }).join("");
+  const dots = points.map((p, i) =>
+    `<circle cx="${px(i).toFixed(1)}" cy="${py(p.y ?? 0).toFixed(1)}" r="4" fill="var(${colorVar})"
+       stroke="var(--surface-1)" stroke-width="2" data-tip="${esc(p.tip || "")}"></circle>`).join("");
+  const firstX = points[0].x, lastX = points[points.length - 1].x;
+  return `<svg viewBox="0 0 ${width} ${height}" width="100%" style="max-width:${width}px">
+    ${gridY}
+    <line class="axis" x1="${padL}" y1="${padT + plotH}" x2="${width - padR}" y2="${padT + plotH}"></line>
+    <path d="${path}" fill="none" stroke="var(${colorVar})" stroke-width="2"></path>
+    ${dots}
+    <text x="${padL}" y="${height - 6}">${esc(firstX)}</text>
+    <text x="${width - padR}" y="${height - 6}" text-anchor="end">${esc(lastX)}</text>
+  </svg>`;
+}
+
+/* ---------- vue Runs ---------- */
+function renderRuns() {
+  const fTask = $("#f-task").value, fAgent = $("#f-agent").value, fStatus = $("#f-status").value;
+  let rows = runs.filter((r) =>
+    (!fTask || r.task === fTask) && (!fAgent || r.agent === fAgent) && (!fStatus || r.status === fStatus));
+  rows.sort((a, b) => {
+    const av = a[sortKey], bv = b[sortKey];
+    if (av == null && bv == null) return 0;
+    if (av == null) return 1;
+    if (bv == null) return -1;
+    return (typeof av === "number" ? av - bv : String(av).localeCompare(String(bv))) * sortDir;
+  });
+  $("#runs-count").textContent = `${rows.length} run(s)`;
+  $("#runs-empty").style.display = rows.length ? "none" : "block";
+  $("#runs-table tbody").innerHTML = rows.map((r) => `
+    <tr data-id="${esc(r.id)}">
+      <td>${esc(fmtDate(r.started_at))}</td>
+      <td>${esc(r.task)}</td>
+      <td><span style="display:inline-flex;align-items:center;gap:6px">
+        <i style="width:9px;height:9px;border-radius:3px;background:var(${seriesVar(r.agent)});display:inline-block"></i>${esc(r.agent)}</span></td>
+      <td><span class="chip ${esc(r.status)}">${esc(r.status)}</span></td>
+      <td class="num">${fmtMs(r.duration_ms)}</td>
+      <td class="num">${fmtMs(r.ttft_ms)}</td>
+      <td class="num">${fmtNum(r.token_total)}</td>
+      <td class="num">${fmtCost(r.cost_usd)}</td>
+      <td>${esc(r.eval_status)} ${r.eval_count ? `(${r.eval_count})` : ""}</td>
+      <td class="num">${r.llm_error_calls || 0}</td>
+    </tr>`).join("");
+  document.querySelectorAll("#runs-table tbody tr").forEach((tr) =>
+    tr.addEventListener("click", () => openDetail(tr.dataset.id)));
+  document.querySelectorAll("#runs-table th").forEach((th) => {
+    th.querySelector(".dir").textContent = th.dataset.k === sortKey ? (sortDir > 0 ? "▲" : "▼") : "";
+  });
+}
+
+/* ---------- vue Tâches ---------- */
+function renderTasks() {
+  const task = $("#t-task").value;
+  const rows = tasks.filter((t) => t.task === task);
+  const container = $("#task-content");
+  if (!rows.length) { container.innerHTML = `<div class="empty">Aucune donnée pour cette tâche.</div>`; return; }
+  const legend = `<div class="legend">${rows.map((r) =>
+    `<span><i style="background:var(${seriesVar(r.agent)})"></i>${esc(r.agent)} — ${r.passed}/${r.runs} passed</span>`).join("")}</div>`;
+  const metric = (title, hint, key, format, invertHint) => {
+    const items = rows.map((r) => ({
+      label: r.agent, value: r[key], colorVar: seriesVar(r.agent),
+      tip: `<b>${esc(r.agent)}</b><br>${title} : ${r[key] == null ? "–" : format(r[key])}<br>${r.runs} run(s), ${r.passed} passed`,
+    }));
+    if (items.every((i) => i.value == null)) return "";
+    return `<div class="card"><h3>${title}</h3><div class="hint">${hint}${invertHint ? " — plus bas = mieux" : ""}</div>${hbarChart({ items, format })}</div>`;
+  };
+  container.innerHTML = legend + `<div class="grid2">` +
+    metric("Durée moyenne", "moyenne par run", "avg_duration_ms", fmtMs, true) +
+    metric("TTFT moyen", "premier token (streaming)", "avg_ttft_ms", fmtMs, true) +
+    metric("Tokens générés", "total sur tous les runs", "token_output", fmtNum, false) +
+    metric("Coût total", "somme usage provider", "cost_usd", fmtCost, true) +
+    metric("Débit moyen", "tokens/s en génération", "avg_output_tokens_per_second", (v) => v.toFixed(1) + " tok/s", false) +
+    `</div>`;
+  bindTips(container);
+}
+
+/* ---------- vue Détail ---------- */
+async function openDetail(id) {
+  switchView("detail");
+  const container = $("#detail-content");
+  container.innerHTML = `<div class="empty">Chargement…</div>`;
+  let detail;
+  try { detail = await api(`/api/runs/${id}`); }
+  catch (err) { container.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
+  const run = detail.run, calls = detail.llm_calls || [];
+  const meta = (label, value) => `<div><dt>${label}</dt><dd>${value}</dd></div>`;
+  const evals = run.evals || [];
+  container.innerHTML = `
+    <button class="link backlink" onclick="switchView('runs')">← Retour aux runs</button>
+    <div class="card"><h3>Run <code>${esc(run.id)}</code></h3>
+      <dl class="meta-grid" style="margin:12px 0 0">
+        ${meta("Tâche", esc(run.task))}${meta("Agent", esc(run.agent))}
+        ${meta("Statut", `<span class="chip ${esc(run.status)}">${esc(run.status)}</span>`)}
+        ${meta("Début", esc(fmtDate(run.started_at)))}${meta("Durée", fmtMs(run.duration_ms))}
+        ${meta("Exit code", esc(run.exit_code ?? "–"))}${meta("Erreurs LLM", run.llm_error_calls || 0)}
+        ${meta("Repo", `<code>${esc(run.repo)}</code>`)}
+        ${meta("Commit", `<code>${esc((run.git?.base_commit || "–").slice(0, 12))}</code>`)}
+        ${meta("Dirty avant/après", `${run.git?.dirty_before ? "oui" : "non"} / ${run.git?.dirty_after ? "oui" : "non"}`)}
+        ${meta("Commande", `<code>${esc((run.command || []).join(" ")).slice(0, 400)}</code>`)}
+      </dl>
+    </div>
+    <div class="card"><h3>Évals (${evals.length})</h3>
+      ${evals.length ? `<table><thead><tr class="static"><th>Commande</th><th>Statut</th><th class="num">Exit</th><th class="num">Durée</th></tr></thead>
+      <tbody>${evals.map((e) => `<tr class="static"><td><code>${esc(e.command)}</code></td>
+        <td><span class="chip ${esc(e.status)}">${esc(e.status)}</span></td>
+        <td class="num">${esc(e.exit_code ?? "–")}</td><td class="num">${fmtMs(e.duration_ms)}</td></tr>`).join("")}</tbody></table>`
+      : `<div class="hint">Aucune éval attachée — <code>agentledger eval ${esc(run.id)} --test "…"</code></div>`}
+    </div>
+    <div class="card"><h3>Appels LLM (${calls.length})</h3>
+      ${calls.length ? `<table><thead><tr class="static"><th>Heure</th><th>Modèle</th><th class="num">HTTP</th>
+        <th class="num">TTFT</th><th class="num">Durée</th><th class="num">In</th><th class="num">Out</th>
+        <th class="num">tok/s</th><th class="num">Coût</th><th>Précision</th></tr></thead>
+      <tbody>${calls.map((c) => `<tr class="static">
+        <td>${esc((c.timestamp || "").slice(11, 19))}</td><td>${esc(c.model || "–")}</td>
+        <td class="num" style="${c.status >= 400 ? "color:var(--critical)" : ""}">${esc(c.status)}</td>
+        <td class="num">${fmtMs(c.ttft_ms)}</td><td class="num">${fmtMs(c.duration_ms)}</td>
+        <td class="num">${fmtNum(c.input_tokens)}</td><td class="num">${fmtNum(c.output_tokens)}</td>
+        <td class="num">${c.output_tokens_per_second == null ? "–" : c.output_tokens_per_second.toFixed(1)}</td>
+        <td class="num">${fmtCost(c.cost_usd)}</td><td>${esc(c.source_precision || "–")}</td></tr>
+        ${c.response_body ? `<tr class="static"><td colspan="10"><details><summary class="hint" style="cursor:pointer">corps de réponse enregistré</summary><pre>${esc(prettyBody(c.response_body))}</pre></details></td></tr>` : ""}`).join("")}</tbody></table>`
+      : `<div class="hint">Aucun appel LLM lié à ce run.</div>`}
+    </div>
+    <div class="card"><h3>Sorties du process</h3>
+      <p><button class="link" id="load-stdout">Charger stdout</button> ·
+         <button class="link" id="load-stderr">Charger stderr</button></p>
+      <pre id="output-pre" style="display:none"></pre>
+    </div>`;
+  const loadOutput = async (stream) => {
+    const pre = $("#output-pre");
+    pre.style.display = "block";
+    pre.textContent = "Chargement…";
+    try {
+      const url = new URL(`/api/runs/${run.id}/output`, location.origin);
+      url.searchParams.set("token", token);
+      url.searchParams.set("stream", stream);
+      const res = await fetch(url);
+      pre.textContent = res.ok ? (await res.text()) || "(vide)" : `(${res.status}) ${await res.text()}`;
+    } catch (err) { pre.textContent = String(err); }
+  };
+  $("#load-stdout").addEventListener("click", () => loadOutput("stdout"));
+  $("#load-stderr").addEventListener("click", () => loadOutput("stderr"));
+}
+
+function prettyBody(text) {
+  try { return JSON.stringify(JSON.parse(text), null, 2).slice(0, 20000); }
+  catch { return String(text).slice(0, 20000); }
+}
+
+/* ---------- vue Tendances ---------- */
+async function renderTrends() {
+  const task = $("#tr-task").value;
+  const container = $("#trends-content");
+  let series;
+  try { series = await api("/api/timeseries", { task }); }
+  catch (err) { container.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
+  if (!series.length) { container.innerHTML = `<div class="empty">Aucune donnée.</div>`; return; }
+  const chart = (title, hint, key, format) => {
+    const points = series.map((s) => ({
+      x: s.day, y: s[key] ?? 0,
+      tip: `<b>${esc(s.day)}</b><br>${title} : ${format(s[key] ?? 0)}<br>${s.runs} run(s), ${s.passed} passed`,
+    }));
+    return `<div class="card"><h3>${title}</h3><div class="hint">${hint}</div>${lineChart({ points, format })}</div>`;
+  };
+  container.innerHTML =
+    chart("Runs par jour", "tous statuts", "runs", fmtNum) +
+    chart("Coût par jour", "somme usage provider", "cost_usd", fmtCost) +
+    chart("Tokens par jour", "total in+out mesuré", "token_total", fmtNum) +
+    chart("Durée moyenne", "par run, par jour", "avg_duration_ms", fmtMs);
+  bindTips(container);
+}
+
+/* ---------- navigation & chargement ---------- */
+function switchView(view) {
+  document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("active", b.dataset.view === view));
+  document.querySelectorAll("main section").forEach((s) => s.classList.toggle("active", s.id === `view-${view}`));
+  if (view === "trends") renderTrends();
+  if (view === "tasks") renderTasks();
+}
+
+function fillSelect(select, values, keepFirst = true) {
+  const current = select.value;
+  const head = keepFirst ? select.options[0].outerHTML : "";
+  select.innerHTML = head + values.map((v) => `<option value="${esc(v)}">${esc(v)}</option>`).join("");
+  select.value = values.includes(current) || current === "" ? current : (keepFirst ? "" : values[0] || "");
+  if (!keepFirst && !select.value && values.length) select.value = values[0];
+}
+
+async function refresh() {
+  [runs, tasks] = await Promise.all([api("/api/runs"), api("/api/tasks")]);
+  assignSlots();
+  const taskNames = [...new Set(runs.map((r) => r.task))].sort();
+  const agentNames = [...new Set(runs.map((r) => r.agent))].sort();
+  fillSelect($("#f-task"), taskNames);
+  fillSelect($("#f-agent"), agentNames);
+  fillSelect($("#tr-task"), taskNames);
+  fillSelect($("#t-task"), taskNames, false);
+  $("#summary").textContent = `${runs.length} runs · ${taskNames.length} tâches · ${agentNames.length} agents`;
+  renderRuns();
+  renderTasks();
+}
+
+document.querySelectorAll("nav button").forEach((b) =>
+  b.addEventListener("click", () => switchView(b.dataset.view)));
+["#f-task", "#f-agent", "#f-status"].forEach((sel) =>
+  $(sel).addEventListener("change", renderRuns));
+$("#t-task").addEventListener("change", renderTasks);
+$("#tr-task").addEventListener("change", renderTrends);
+document.querySelectorAll("#runs-table th").forEach((th) =>
+  th.addEventListener("click", () => {
+    const k = th.dataset.k;
+    if (sortKey === k) sortDir = -sortDir; else { sortKey = k; sortDir = k === "started_at" ? -1 : 1; }
+    renderRuns();
+  }));
+
+refresh().then(() => {
+  const [view, arg] = location.hash.slice(1).split("=");
+  if (view === "tasks" && arg) { $("#t-task").value = decodeURIComponent(arg); renderTasks(); }
+  if (["runs", "tasks", "detail", "trends"].includes(view)) switchView(view);
+}).catch((err) => {
+  document.body.insertAdjacentHTML("beforeend",
+    `<div class="empty">Erreur de chargement : ${esc(err.message)} — vérifiez le token dans l'URL.</div>`);
+});
+</script>
+</body>
+</html>

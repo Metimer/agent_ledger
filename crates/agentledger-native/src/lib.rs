@@ -5,8 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
@@ -14,6 +13,8 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+mod dashboard;
+mod db;
 mod proxy;
 
 const SCHEMA_VERSION: u32 = 1;
@@ -374,12 +375,29 @@ enum Commands {
         #[arg(long, default_value = ".")]
         root: PathBuf,
     },
+    Db {
+        #[command(subcommand)]
+        command: DbCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
 enum RegistryCommand {
     List,
     Doctor,
+}
+
+#[derive(Subcommand, Debug)]
+enum DbCommand {
+    Sync {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+    },
+    Query {
+        sql: String,
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+    },
 }
 
 #[pyfunction]
@@ -463,6 +481,24 @@ fn eval_run(
 }
 
 #[pyfunction]
+fn sync_db(py: Python<'_>, root: Option<String>) -> PyResult<String> {
+    let root = root.unwrap_or_else(|| ".".to_string());
+    let report = py
+        .detach(move || db::sync(Path::new(&root)))
+        .map_err(|err| to_py_err(Error::Storage(err)))?;
+    serde_json::to_string_pretty(&report).map_err(|err| to_py_err(Error::Json(err)))
+}
+
+#[pyfunction]
+fn query_db(py: Python<'_>, sql: String, root: Option<String>) -> PyResult<String> {
+    let root = root.unwrap_or_else(|| ".".to_string());
+    let rows = py
+        .detach(move || db::query(Path::new(&root), &sql))
+        .map_err(|err| to_py_err(Error::Storage(err)))?;
+    serde_json::to_string(&rows).map_err(|err| to_py_err(Error::Json(err)))
+}
+
+#[pyfunction]
 fn compare_runs(task: Option<String>, root: Option<String>) -> PyResult<String> {
     let root = root.unwrap_or_else(|| ".".to_string());
     let report = compare(task, Path::new(&root)).map_err(to_py_err)?;
@@ -541,6 +577,8 @@ fn _native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_task, m)?)?;
     m.add_function(wrap_pyfunction!(bench_matrix, m)?)?;
     m.add_function(wrap_pyfunction!(eval_run, m)?)?;
+    m.add_function(wrap_pyfunction!(sync_db, m)?)?;
+    m.add_function(wrap_pyfunction!(query_db, m)?)?;
     m.add_function(wrap_pyfunction!(compare_runs, m)?)?;
     m.add_function(wrap_pyfunction!(export_ledger, m)?)?;
     m.add_function(wrap_pyfunction!(doctor, m)?)?;
@@ -611,7 +649,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&record)?);
         }
         Commands::Dashboard { bind, root } => {
-            serve_dashboard(&bind, &root)?;
+            dashboard::serve_dashboard(&bind, &root).map_err(Error::Capture)?;
         }
         Commands::Proxy {
             bind,
@@ -650,6 +688,17 @@ fn dispatch(cli: Cli) -> Result<()> {
         Commands::Doctor { root } => {
             println!("{}", doctor_report(&root));
         }
+        Commands::Db { command } => match command {
+            DbCommand::Sync { root } => {
+                let report = db::sync(&root).map_err(Error::Storage)?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            DbCommand::Query { sql, root } => {
+                for row in db::query(&root, &sql).map_err(Error::Storage)? {
+                    println!("{}", serde_json::to_string(&row)?);
+                }
+            }
+        },
     }
     Ok(())
 }
@@ -1468,107 +1517,6 @@ fn csv_escape(value: &str) -> String {
         value.to_string()
     }
 }
-
-fn serve_dashboard(bind: &str, root: &Path) -> Result<()> {
-    let listener = TcpListener::bind(bind)?;
-    let address = listener.local_addr()?;
-    let token = Uuid::new_v4().to_string();
-    println!("AgentLedger dashboard: http://{address}/?token={token}");
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                if let Err(err) = handle_dashboard_connection(stream, root, &token) {
-                    eprintln!("dashboard request error: {err}");
-                }
-            }
-            Err(err) => return Err(Error::Io(err)),
-        }
-    }
-    Ok(())
-}
-
-fn handle_dashboard_connection(mut stream: TcpStream, root: &Path, token: &str) -> Result<()> {
-    let mut buffer = [0_u8; 4096];
-    let read = stream.read(&mut buffer)?;
-    let request = String::from_utf8_lossy(&buffer[..read]);
-    let request_line = request.lines().next().unwrap_or_default();
-    let authorized = request_line.contains(&format!("token={token}"))
-        || request.contains(&format!("Authorization: Bearer {token}"));
-    if !authorized {
-        write_response(
-            &mut stream,
-            "401 Unauthorized",
-            "text/plain",
-            "missing token",
-        )?;
-        return Ok(());
-    }
-
-    if request_line.starts_with("GET /api/runs") {
-        let report = compare(None, root)?;
-        let body = serde_json::to_string_pretty(&report)?;
-        write_response(&mut stream, "200 OK", "application/json", &body)?;
-    } else {
-        write_response(
-            &mut stream,
-            "200 OK",
-            "text/html; charset=utf-8",
-            DASHBOARD_HTML,
-        )?;
-    }
-    Ok(())
-}
-
-fn write_response(
-    stream: &mut TcpStream,
-    status: &str,
-    content_type: &str,
-    body: &str,
-) -> Result<()> {
-    write!(
-        stream,
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\r\n{body}",
-        body.len()
-    )?;
-    Ok(())
-}
-
-const DASHBOARD_HTML: &str = r#"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AgentLedger</title>
-  <style>
-    body { font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 32px; color: #172026; background: #f7f8fa; }
-    main { max-width: 1120px; margin: 0 auto; }
-    h1 { font-size: 24px; margin: 0 0 16px; }
-    table { width: 100%; border-collapse: collapse; background: white; border: 1px solid #d8dee4; }
-    th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid #d8dee4; font-size: 14px; }
-    th { background: #eef1f4; }
-    code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-  </style>
-</head>
-<body>
-  <main>
-    <h1>AgentLedger Runs</h1>
-    <table>
-      <thead><tr><th>ID</th><th>Task</th><th>Agent</th><th>Status</th><th>Duration</th><th>Eval</th><th>LLM Precision</th></tr></thead>
-      <tbody id="runs"><tr><td colspan="7">Loading...</td></tr></tbody>
-    </table>
-  </main>
-  <script>
-    const token = new URLSearchParams(location.search).get("token");
-    fetch(`/api/runs?token=${encodeURIComponent(token || "")}`)
-      .then((r) => r.json())
-      .then((data) => {
-        const rows = data.runs.map((run) => `<tr><td><code>${run.id.slice(0, 8)}</code></td><td>${run.task}</td><td>${run.agent}</td><td>${run.status}</td><td>${run.duration_ms} ms</td><td>${run.eval_status}</td><td>${run.llm_metrics_precision}</td></tr>`);
-        document.getElementById("runs").innerHTML = rows.join("") || '<tr><td colspan="7">No runs yet.</td></tr>';
-      });
-  </script>
-</body>
-</html>
-"#;
 
 fn doctor_report(root: &Path) -> String {
     let mut lines = Vec::new();

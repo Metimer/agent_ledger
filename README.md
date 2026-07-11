@@ -17,7 +17,8 @@ Current MVP capabilities:
 - attach simple eval commands to a run;
 - compare runs by task;
 - export the ledger as JSONL or CSV;
-- open a token-protected local dashboard on `127.0.0.1`;
+- index every run and LLM call into an embedded SQLite database for SQL queries;
+- open a token-protected local dashboard on `127.0.0.1` with filterable runs, per-task agent comparison charts, run details and daily trends;
 - use a Python API around the same native core;
 - run a loopback OpenAI-compatible proxy that records LLM call metrics in `.agentledger/llm_calls.ndjson`;
 - launch the proxy automatically inside `agentledger run` and attach calls to the captured run;
@@ -25,7 +26,7 @@ Current MVP capabilities:
 - run benchmark matrices (tasks × agents × providers × repeats) from a TOML file;
 - re-evaluate an existing run post-hoc with `agentledger eval <run-id> --test <cmd>`.
 
-Planned next layers are proxy replay, Parquet/DuckDB analytics and OTLP export.
+Planned next layers are proxy replay, Parquet export, OTLP export and a PostgreSQL export target for team-wide aggregation.
 
 ## Quickstart
 
@@ -77,6 +78,19 @@ upstream = "http://127.0.0.1:11434/v1"
 ```
 
 Python: `al.bench(matrix="bench.toml", repo=".", task=None)` returns a `BenchReport` with `cell_count`, `passed`, `failed` and per-cell run ids; runs land in the same ledger, so `al.compare(task=...)` aggregates them.
+
+## Analytics: SQLite index and dashboard
+
+The NDJSON ledger stays the source of truth; `agentledger db sync` builds (and incrementally catches up) a rebuildable SQLite index at `.agentledger/ledger.db` with `runs`, `evals` and `llm_calls` tables. Query it with arbitrary read-only SQL:
+
+```bash
+agentledger db sync
+agentledger db query "SELECT task, agent, count(*) runs, avg(duration_ms) avg_ms FROM runs GROUP BY 1, 2"
+```
+
+Python: `al.sync_db(root=".")` and `al.query("SELECT ...", root=".")` (rows as dicts, resynced automatically).
+
+`agentledger dashboard` serves a token-protected local UI on loopback backed by the same index: a filterable/sortable runs table, per-task agent comparison charts (duration, TTFT, tokens, cost, tokens/s), a run detail view (evals, LLM calls with metrics and recorded bodies, stdout/stderr) and daily trend charts. JSON endpoints (`/api/runs`, `/api/runs/{id}`, `/api/runs/{id}/output`, `/api/tasks`, `/api/timeseries`) are available with the same token for scripting.
 
 ## Post-hoc evals
 

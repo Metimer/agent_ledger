@@ -147,6 +147,12 @@ class AgentLedger:
     def eval(self, *, run_id: str, tests: Iterable[str]) -> RunResult:
         return eval(run_id=run_id, tests=tests, root=self.root)
 
+    def sync_db(self) -> dict[str, Any]:
+        return sync_db(root=self.root)
+
+    def query(self, sql: str) -> list[dict[str, Any]]:
+        return query(sql, root=self.root)
+
     def compare(self, task: str | None = None) -> CompareReport:
         return compare(task=task, root=self.root)
 
@@ -209,6 +215,16 @@ def bench(
 def compare(task: str | None = None, root: str | Path = ".") -> CompareReport:
     payload = _native.compare_runs(task, str(root))
     return CompareReport(json.loads(payload))
+
+
+def sync_db(root: str | Path = ".") -> dict[str, Any]:
+    """Synchronise l'index SQLite (.agentledger/ledger.db) depuis le ledger NDJSON."""
+    return json.loads(_native.sync_db(str(root)))
+
+
+def query(sql: str, root: str | Path = ".") -> list[dict[str, Any]]:
+    """Requête SQL en lecture seule sur l'index SQLite (synchronisé au préalable)."""
+    return json.loads(_native.query_db(sql, str(root)))
 
 
 def replay(*args: Any, **kwargs: Any) -> None:
@@ -274,6 +290,8 @@ __all__ = [
     "init",
     "open_dashboard",
     "openai_proxy",
+    "query",
     "replay",
     "run",
+    "sync_db",
 ]

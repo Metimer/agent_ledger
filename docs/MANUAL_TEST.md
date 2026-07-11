@@ -250,17 +250,25 @@ agentledger export --format jsonl
 - `runs.csv` : en-tête `id,task,agent,status,...` + une ligne par run.
 - `export --format parquet` → erreur explicite « planned for the analytics extra ».
 
-## 11. Dashboard
+## 11. Index SQLite et dashboard
 
 ```bash
+agentledger db sync
+agentledger db query "SELECT task, agent, count(*) AS runs FROM runs GROUP BY 1, 2"
 agentledger dashboard &
 ```
 
 **Attendu** :
-- Ligne `AgentLedger dashboard: http://127.0.0.1:<port>/?token=<uuid>`.
-- Ouvrir l'URL **avec** token : tableau HTML des runs (ID, Task, Agent, Status, Duration, Eval, LLM Precision).
-- `curl http://127.0.0.1:<port>/` **sans** token → `401 missing token`.
-- `curl "http://127.0.0.1:<port>/api/runs?token=<uuid>"` → JSON du compare.
+- `db sync` → JSON avec `runs_upserted`/`llm_calls_upserted` et le chemin `.agentledger/ledger.db` ; un second `db sync` → compteurs à 0 (incrémental).
+- `db query` → une ligne JSON par résultat ; une requête d'écriture (`INSERT ...`) → erreur « readonly ».
+- Dashboard : ligne `AgentLedger dashboard: http://127.0.0.1:<port>/?token=<uuid>`.
+- Ouvrir l'URL avec token et vérifier les **4 vues** :
+  1. **Runs** — tableau filtrable (tâche/agent/statut) et triable, colonnes durée/TTFT/tokens/coût/éval/erreurs LLM ; clic sur une ligne → détail.
+  2. **Tâches** — sélectionner une tâche de bench : barres comparatives par agent (durée, TTFT, tokens, coût, tok/s) + « n/m passed » ; les agents gardent la même couleur partout.
+  3. **Détail** — méta du run, git, évals, appels LLM (statut HTTP en rouge si ≥ 400, corps dépliables si `record_bodies`), boutons stdout/stderr.
+  4. **Tendances** — courbes par jour (runs, coût, tokens, durée moyenne), filtrables par tâche.
+- `curl http://127.0.0.1:<port>/api/runs` **sans** token → `401`.
+- `curl "http://127.0.0.1:<port>/api/tasks?token=<uuid>"` → agrégats JSON par tâche×agent.
 - `kill %1` pour arrêter.
 
 ## 12. API Python

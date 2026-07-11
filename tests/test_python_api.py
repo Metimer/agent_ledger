@@ -280,6 +280,46 @@ def test_post_hoc_eval_updates_existing_run(tmp_path: Path) -> None:
     assert report.data["runs"][0]["eval_status"] == "failed"
 
 
+def test_sqlite_index_sync_and_query(tmp_path: Path) -> None:
+    init_git_repo(tmp_path)
+    agentledger.init(tmp_path)
+
+    first = agentledger.run(
+        task="db-smoke",
+        agent="custom",
+        command=[sys.executable, "-c", "print('ok')"],
+        repo=tmp_path,
+    )
+    report = agentledger.sync_db(root=tmp_path)
+    assert report["runs_upserted"] == 1
+    assert (tmp_path / ".agentledger" / "ledger.db").exists()
+
+    rows = agentledger.query(
+        "SELECT id, task, status FROM runs ORDER BY started_at", root=tmp_path
+    )
+    assert len(rows) == 1
+    assert rows[0]["id"] == first.id
+    assert rows[0]["status"] == "passed"
+
+    # La requête resynchronise automatiquement les nouveaux événements.
+    agentledger.run(
+        task="db-smoke",
+        agent="custom",
+        command=[sys.executable, "-c", "print('encore')"],
+        repo=tmp_path,
+    )
+    rows = agentledger.query("SELECT count(*) AS n FROM runs", root=tmp_path)
+    assert rows[0]["n"] == 2
+
+    # L'eval post-hoc réécrit la même ligne (pas de doublon).
+    agentledger.eval(run_id=first.id, tests=["test -f README.md"], root=tmp_path)
+    rows = agentledger.query(
+        "SELECT count(*) AS n, sum(eval_count) AS evals FROM runs", root=tmp_path
+    )
+    assert rows[0]["n"] == 2
+    assert rows[0]["evals"] == 1
+
+
 def test_doctor(tmp_path: Path) -> None:
     text = agentledger.doctor(tmp_path)
     assert "AgentLedger" in text
