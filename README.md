@@ -19,7 +19,8 @@ Current MVP capabilities:
 - export the ledger as JSONL or CSV;
 - open a token-protected local dashboard on `127.0.0.1`;
 - use a Python API around the same native core;
-- run a loopback OpenAI-compatible proxy that records LLM call metrics in `.agentledger/llm_calls.ndjson`.
+- run a loopback OpenAI-compatible proxy that records LLM call metrics in `.agentledger/llm_calls.ndjson`;
+- launch the proxy automatically inside `agentledger run` and attach calls to the captured run.
 
 Planned next layers are streaming-first proxy replay, matrix benchmarks, Parquet/DuckDB analytics and OTLP export.
 
@@ -28,13 +29,14 @@ Planned next layers are streaming-first proxy replay, matrix benchmarks, Parquet
 ```bash
 agentledger init
 agentledger run --task smoke --agent custom --allow-dirty -- echo ok
+agentledger run --task provider-smoke --proxy-upstream http://127.0.0.1:11434/v1 -- python my_agent.py
 agentledger compare smoke
 agentledger export --format csv
 agentledger proxy --upstream http://127.0.0.1:11434/v1
 agentledger dashboard
 ```
 
-When `agentledger run` launches a command, it injects `AGENTLEDGER_RUN_ID`, `AGENTLEDGER_ROOT`, and `AGENTLEDGER_PROXY_RUN_HEADER`. Clients that send the `x-agentledger-run-id` header through the proxy get their LLM calls aggregated into `agentledger compare`.
+When `agentledger run` launches a command, it injects `AGENTLEDGER_RUN_ID`, `AGENTLEDGER_ROOT`, and `AGENTLEDGER_PROXY_RUN_HEADER`. With `--proxy-upstream`, it also starts a loopback proxy, injects `OPENAI_BASE_URL`, `OPENAI_API_BASE`, and `AGENTLEDGER_PROXY_URL`, then links every proxied call to the run automatically. Clients that send the `x-agentledger-run-id` header through a separately launched proxy are still aggregated into `agentledger compare`.
 
 Python:
 
@@ -47,6 +49,7 @@ run = al.run(
     agent="custom",
     command=["python", "-c", "print('ok')"],
     allow_dirty=True,
+    proxy_upstream="http://127.0.0.1:11434/v1",
 )
 report = al.compare(task="smoke")
 print(report.to_markdown())

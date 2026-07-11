@@ -236,6 +236,14 @@ struct RunMetrics {
     output_tokens_per_second: Option<f64>,
 }
 
+#[derive(Debug, Clone)]
+struct ProxyRunConfig {
+    bind: String,
+    upstream: String,
+    api_key_env: Option<String>,
+    record_bodies: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct CompareReport {
     schema_version: u32,
@@ -287,6 +295,14 @@ enum Commands {
         allow_dirty: bool,
         #[arg(long = "eval")]
         eval_commands: Vec<String>,
+        #[arg(long)]
+        proxy_upstream: Option<String>,
+        #[arg(long, default_value = "127.0.0.1:0")]
+        proxy_bind: String,
+        #[arg(long)]
+        proxy_api_key_env: Option<String>,
+        #[arg(long)]
+        proxy_record_bodies: bool,
         #[arg(last = true, required = true)]
         command: Vec<OsString>,
     },
@@ -368,24 +384,42 @@ fn init_project(path: String) -> PyResult<String> {
 }
 
 #[pyfunction]
+#[allow(clippy::too_many_arguments)]
 fn run_task(
+    py: Python<'_>,
     task: String,
     agent: String,
     command: Vec<String>,
     repo: Option<String>,
     eval_commands: Option<Vec<String>>,
     allow_dirty: Option<bool>,
+    proxy_upstream: Option<String>,
+    proxy_bind: Option<String>,
+    proxy_api_key_env: Option<String>,
+    proxy_record_bodies: Option<bool>,
 ) -> PyResult<String> {
     let repo = repo.unwrap_or_else(|| ".".to_string());
-    let record = run_capture(
-        &task,
-        &agent,
-        command,
-        Path::new(&repo),
-        eval_commands.unwrap_or_default(),
-        allow_dirty.unwrap_or(false),
-    )
-    .map_err(to_py_err)?;
+    let proxy_config = proxy_upstream.map(|upstream| ProxyRunConfig {
+        bind: proxy_bind.unwrap_or_else(|| "127.0.0.1:0".to_string()),
+        upstream,
+        api_key_env: proxy_api_key_env,
+        record_bodies: proxy_record_bodies.unwrap_or(false),
+    });
+    // Release the GIL: the captured command or the proxy may call back into
+    // Python-hosted servers running in other threads of this process.
+    let record = py
+        .detach(move || {
+            run_capture(
+                &task,
+                &agent,
+                command,
+                Path::new(&repo),
+                eval_commands.unwrap_or_default(),
+                allow_dirty.unwrap_or(false),
+                proxy_config,
+            )
+        })
+        .map_err(to_py_err)?;
     serde_json::to_string_pretty(&record).map_err(|err| to_py_err(Error::Json(err)))
 }
 
@@ -411,6 +445,7 @@ fn doctor(root: Option<String>) -> PyResult<String> {
 
 #[pyfunction]
 fn start_proxy(
+    py: Python<'_>,
     bind: String,
     upstream: String,
     root: Option<String>,
@@ -419,18 +454,20 @@ fn start_proxy(
 ) -> PyResult<()> {
     let root = root.unwrap_or_else(|| ".".to_string());
     let api_key = api_key_env.and_then(|name| std::env::var(name).ok());
-    proxy::serve_proxy(
-        &bind,
-        &upstream,
-        Path::new(&root),
-        api_key,
-        record_bodies.unwrap_or(false),
-    )
+    py.detach(move || {
+        proxy::serve_proxy(
+            &bind,
+            &upstream,
+            Path::new(&root),
+            api_key,
+            record_bodies.unwrap_or(false),
+        )
+    })
     .map_err(|err| to_py_err(Error::Capture(err)))
 }
 
 #[pyfunction]
-fn run_cli(argv: Vec<String>) -> PyResult<i32> {
+fn run_cli(py: Python<'_>, argv: Vec<String>) -> PyResult<i32> {
     let args = std::iter::once("agentledger".to_string()).chain(argv);
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
@@ -442,7 +479,7 @@ fn run_cli(argv: Vec<String>) -> PyResult<i32> {
         }
     };
 
-    match dispatch(cli) {
+    match py.detach(move || dispatch(cli)) {
         Ok(()) => Ok(0),
         Err(err) => {
             eprintln!("error: {err}");
@@ -482,13 +519,31 @@ fn dispatch(cli: Cli) -> Result<()> {
             repo,
             allow_dirty,
             eval_commands,
+            proxy_upstream,
+            proxy_bind,
+            proxy_api_key_env,
+            proxy_record_bodies,
             command,
         } => {
             let command = command
                 .into_iter()
                 .map(|part| part.to_string_lossy().to_string())
                 .collect::<Vec<_>>();
-            let record = run_capture(&task, &agent, command, &repo, eval_commands, allow_dirty)?;
+            let proxy_config = proxy_upstream.map(|upstream| ProxyRunConfig {
+                bind: proxy_bind,
+                upstream,
+                api_key_env: proxy_api_key_env,
+                record_bodies: proxy_record_bodies,
+            });
+            let record = run_capture(
+                &task,
+                &agent,
+                command,
+                &repo,
+                eval_commands,
+                allow_dirty,
+                proxy_config,
+            )?;
             println!("{}", serde_json::to_string_pretty(&record)?);
         }
         Commands::Bench { matrix, task } => {
@@ -591,6 +646,7 @@ fn run_capture(
     repo: &Path,
     eval_commands: Vec<String>,
     allow_dirty: bool,
+    proxy_config: Option<ProxyRunConfig>,
 ) -> Result<RunRecord> {
     if command.is_empty() {
         return Err(Error::Config("run command cannot be empty".to_string()));
@@ -617,9 +673,34 @@ fn run_capture(
     let stdout_path = run_dir.join("stdout.txt");
     let stderr_path = run_dir.join("stderr.txt");
 
+    let proxy_api_key_env_present = proxy_config
+        .as_ref()
+        .and_then(|config| config.api_key_env.as_ref())
+        .is_some();
+    let proxy_handle = if let Some(config) = proxy_config.as_ref() {
+        let api_key = config
+            .api_key_env
+            .as_ref()
+            .and_then(|name| std::env::var(name).ok());
+        Some(
+            proxy::start_proxy_background(
+                &config.bind,
+                &config.upstream,
+                &repo,
+                api_key,
+                config.record_bodies,
+                Some(run_id.clone()),
+            )
+            .map_err(Error::Capture)?,
+        )
+    } else {
+        None
+    };
+
     let started_at = now_rfc3339()?;
     let timer = Instant::now();
-    let output = Command::new(&command[0])
+    let mut child = Command::new(&command[0]);
+    child
         .args(&command[1..])
         .current_dir(&repo)
         .env("AGENTLEDGER_RUN_ID", &run_id)
@@ -629,9 +710,22 @@ fn run_capture(
             format!("x-agentledger-run-id: {run_id}"),
         )
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    if let Some(proxy_handle) = proxy_handle.as_ref() {
+        child
+            .env("AGENTLEDGER_PROXY_URL", proxy_handle.base_url())
+            .env("OPENAI_BASE_URL", proxy_handle.base_url())
+            .env("OPENAI_API_BASE", proxy_handle.base_url());
+        if proxy_api_key_env_present || std::env::var_os("OPENAI_API_KEY").is_none() {
+            child.env("OPENAI_API_KEY", "agentledger-proxy");
+        }
+    }
+
+    let output = child
         .output()
         .map_err(|err| Error::Capture(format!("failed to run {:?}: {err}", command)))?;
+    drop(proxy_handle);
     let duration_ms = timer.elapsed().as_millis();
     let ended_at = now_rfc3339()?;
 

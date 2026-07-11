@@ -8,11 +8,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::net::TcpListener as StdTcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::Instant;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -22,6 +25,30 @@ struct ProxyState {
     client: reqwest::Client,
     api_key: Option<String>,
     record_bodies: bool,
+    default_run_id: Option<String>,
+}
+
+pub struct ProxyHandle {
+    base_url: String,
+    shutdown: Option<oneshot::Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl ProxyHandle {
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+}
+
+impl Drop for ProxyHandle {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -69,7 +96,60 @@ pub fn serve_proxy(
         root.to_path_buf(),
         api_key,
         record_bodies,
+        None,
     ))
+}
+
+pub fn start_proxy_background(
+    bind: &str,
+    upstream_base: &str,
+    root: &Path,
+    api_key: Option<String>,
+    record_bodies: bool,
+    default_run_id: Option<String>,
+) -> Result<ProxyHandle, String> {
+    ensure_proxy_store(root).map_err(|err| err.to_string())?;
+    let std_listener = StdTcpListener::bind(bind).map_err(|err| err.to_string())?;
+    std_listener
+        .set_nonblocking(true)
+        .map_err(|err| err.to_string())?;
+    let address = std_listener.local_addr().map_err(|err| err.to_string())?;
+    let base_url = format!("http://{address}/v1");
+    let upstream_base = upstream_base.trim_end_matches('/').to_string();
+    let root = root.to_path_buf();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let thread = thread::spawn(move || {
+        let runtime = match tokio::runtime::Runtime::new() {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                eprintln!("agentledger proxy runtime error: {err}");
+                return;
+            }
+        };
+        if let Err(err) = runtime.block_on(async move {
+            let listener =
+                tokio::net::TcpListener::from_std(std_listener).map_err(|err| err.to_string())?;
+            run_proxy_server(
+                listener,
+                upstream_base,
+                root,
+                api_key,
+                record_bodies,
+                default_run_id,
+                Some(shutdown_rx),
+            )
+            .await
+        }) {
+            eprintln!("agentledger proxy server error: {err}");
+        }
+    });
+
+    Ok(ProxyHandle {
+        base_url,
+        shutdown: Some(shutdown_tx),
+        thread: Some(thread),
+    })
 }
 
 async fn serve_proxy_async(
@@ -78,36 +158,80 @@ async fn serve_proxy_async(
     root: PathBuf,
     api_key: Option<String>,
     record_bodies: bool,
+    default_run_id: Option<String>,
 ) -> Result<(), String> {
     ensure_proxy_store(&root).map_err(|err| err.to_string())?;
+    let listener = tokio::net::TcpListener::bind(&bind)
+        .await
+        .map_err(|err| err.to_string())?;
+    run_proxy_server(
+        listener,
+        upstream_base,
+        root,
+        api_key,
+        record_bodies,
+        default_run_id,
+        None,
+    )
+    .await
+}
+
+async fn run_proxy_server(
+    listener: tokio::net::TcpListener,
+    upstream_base: String,
+    root: PathBuf,
+    api_key: Option<String>,
+    record_bodies: bool,
+    default_run_id: Option<String>,
+    shutdown: Option<oneshot::Receiver<()>>,
+) -> Result<(), String> {
+    let state = build_state(upstream_base, root, api_key, record_bodies, default_run_id)?;
+    let app = proxy_router(state.clone());
+    let address = listener.local_addr().map_err(|err| err.to_string())?;
+    println!("AgentLedger OpenAI-compatible proxy: http://{address}/v1");
+    println!("Forwarding upstream: {}", state.upstream_base);
+
+    let server = axum::serve(listener, app);
+    if let Some(shutdown) = shutdown {
+        server
+            .with_graceful_shutdown(async {
+                let _ = shutdown.await;
+            })
+            .await
+            .map_err(|err| err.to_string())
+    } else {
+        server.await.map_err(|err| err.to_string())
+    }
+}
+
+fn build_state(
+    upstream_base: String,
+    root: PathBuf,
+    api_key: Option<String>,
+    record_bodies: bool,
+    default_run_id: Option<String>,
+) -> Result<Arc<ProxyState>, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(600))
         .build()
         .map_err(|err| err.to_string())?;
 
-    let state = Arc::new(ProxyState {
+    Ok(Arc::new(ProxyState {
         upstream_base,
         ledger_root: root,
         client,
         api_key,
         record_bodies,
-    });
+        default_run_id,
+    }))
+}
 
-    let app = Router::new()
+fn proxy_router(state: Arc<ProxyState>) -> Router {
+    Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/v1/chat/completions", post(forward_chat_completions))
         .route("/v1/responses", post(forward_responses))
-        .with_state(state.clone());
-
-    let listener = tokio::net::TcpListener::bind(&bind)
-        .await
-        .map_err(|err| err.to_string())?;
-    let address = listener.local_addr().map_err(|err| err.to_string())?;
-    println!("AgentLedger OpenAI-compatible proxy: http://{address}/v1");
-    println!("Forwarding upstream: {}", state.upstream_base);
-    axum::serve(listener, app)
-        .await
-        .map_err(|err| err.to_string())
+        .with_state(state)
 }
 
 async fn forward_chat_completions(
@@ -134,7 +258,7 @@ async fn forward_openai_endpoint(
 ) -> Response {
     let started = Instant::now();
     let request_json = serde_json::from_slice::<Value>(&body).ok();
-    let url = format!("{}{}", state.upstream_base, endpoint);
+    let url = upstream_url(&state.upstream_base, endpoint);
     let mut request = state.client.post(url).body(body.clone());
 
     request = apply_forward_headers(request, &headers, state.api_key.as_deref());
@@ -161,7 +285,7 @@ async fn forward_openai_endpoint(
 
     let record = build_record(
         endpoint,
-        extract_run_id(&headers),
+        extract_run_id(&headers).or_else(|| state.default_run_id.clone()),
         &state.upstream_base,
         status.as_u16(),
         duration_ms,
@@ -174,6 +298,14 @@ async fn forward_openai_endpoint(
     }
 
     response_from_upstream(status, &response_headers, response_bytes)
+}
+
+fn upstream_url(upstream_base: &str, endpoint: &str) -> String {
+    if upstream_base.ends_with("/v1") && endpoint.starts_with("/v1/") {
+        format!("{}{}", upstream_base, &endpoint[3..])
+    } else {
+        format!("{upstream_base}{endpoint}")
+    }
 }
 
 fn extract_run_id(headers: &HeaderMap) -> Option<String> {
@@ -225,7 +357,7 @@ fn response_from_upstream(
         body,
     )
         .into_response();
-    for name in ["content-type", "cache-control"] {
+    for name in ["content-type", "cache-control", "content-length"] {
         if let Some(value) = headers.get(name) {
             if let Ok(value) = HeaderValue::from_bytes(value.as_bytes()) {
                 response.headers_mut().insert(name, value);

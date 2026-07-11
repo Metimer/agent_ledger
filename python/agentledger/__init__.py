@@ -98,6 +98,10 @@ class AgentLedger:
         command: Iterable[str],
         eval_commands: Iterable[str] | None = None,
         allow_dirty: bool = False,
+        proxy_upstream: str | None = None,
+        proxy_bind: str = "127.0.0.1:0",
+        proxy_api_key_env: str | None = None,
+        proxy_record_bodies: bool = False,
     ) -> RunResult:
         return run(
             task=task,
@@ -106,6 +110,10 @@ class AgentLedger:
             repo=self.root,
             eval_commands=eval_commands,
             allow_dirty=allow_dirty,
+            proxy_upstream=proxy_upstream,
+            proxy_bind=proxy_bind,
+            proxy_api_key_env=proxy_api_key_env,
+            proxy_record_bodies=proxy_record_bodies,
         )
 
     def compare(self, task: str | None = None) -> CompareReport:
@@ -135,6 +143,10 @@ def run(
     repo: str | Path = ".",
     eval_commands: Iterable[str] | None = None,
     allow_dirty: bool = False,
+    proxy_upstream: str | None = None,
+    proxy_bind: str = "127.0.0.1:0",
+    proxy_api_key_env: str | None = None,
+    proxy_record_bodies: bool = False,
 ) -> RunResult:
     payload = _native.run_task(
         task,
@@ -143,6 +155,10 @@ def run(
         str(repo),
         [str(part) for part in eval_commands] if eval_commands is not None else None,
         allow_dirty,
+        proxy_upstream,
+        proxy_bind,
+        proxy_api_key_env,
+        proxy_record_bodies,
     )
     return RunResult(json.loads(payload))
 
