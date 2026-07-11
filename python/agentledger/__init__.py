@@ -125,6 +125,7 @@ class AgentLedger:
         proxy_bind: str = "127.0.0.1:0",
         proxy_api_key_env: str | None = None,
         proxy_record_bodies: bool = False,
+        fail_on_llm_error: bool = False,
     ) -> RunResult:
         return run(
             task=task,
@@ -137,6 +138,7 @@ class AgentLedger:
             proxy_bind=proxy_bind,
             proxy_api_key_env=proxy_api_key_env,
             proxy_record_bodies=proxy_record_bodies,
+            fail_on_llm_error=fail_on_llm_error,
         )
 
     def bench(self, *, matrix: str | Path, task: str | None = None) -> BenchReport:
@@ -176,6 +178,7 @@ def run(
     proxy_bind: str = "127.0.0.1:0",
     proxy_api_key_env: str | None = None,
     proxy_record_bodies: bool = False,
+    fail_on_llm_error: bool = False,
 ) -> RunResult:
     payload = _native.run_task(
         task,
@@ -188,6 +191,7 @@ def run(
         proxy_bind,
         proxy_api_key_env,
         proxy_record_bodies,
+        fail_on_llm_error,
     )
     return RunResult(json.loads(payload))
 

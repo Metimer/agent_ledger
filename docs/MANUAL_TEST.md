@@ -175,6 +175,8 @@ agentledger compare or-smoke
 **Bench avec l'axe provider** : ajouter au `bench.toml` de l'étape 8 :
 
 ```toml
+fail_on_llm_error = true
+
 [[providers]]
 name = "openrouter"
 upstream = "https://openrouter.ai/api/v1"
@@ -182,6 +184,16 @@ api_key_env = "OPENROUTER_API_KEY"
 ```
 
 Les cellules apparaissent alors avec `"agent": "echo@openrouter"` et chaque run a son proxy dédié.
+
+**Robustesse aux erreurs provider** : `curl` sort en 0 même sur un HTTP 429 (rate limit), donc un run peut être `passed` alors que l'appel LLM a échoué. Deux parades : ajouter `--fail-with-body` aux commandes curl, et/ou passer `--fail-on-llm-error` au run (ou `fail_on_llm_error = true` dans la matrice). Chaque run enregistre aussi `llm_error_calls` (nombre d'appels proxifiés en statut ≥ 400).
+
+```bash
+agentledger run --task guard --allow-dirty --fail-on-llm-error \
+  --proxy-upstream https://openrouter.ai/api/v1 --proxy-api-key-env OPENROUTER_API_KEY -- \
+  sh -c "curl -sS -X POST \"\$OPENAI_BASE_URL/chat/completions\" -H 'content-type: application/json' -d '{\"model\":\"modele-rate-limite:free\",\"messages\":[]}'"
+```
+
+**Attendu** : si le provider répond ≥ 400, le run sort avec `"status": "failed"` et `"llm_error_calls": 1` même si curl a réussi.
 
 ## 8. Bench matrix
 

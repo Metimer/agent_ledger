@@ -202,6 +202,8 @@ struct RunRecord {
     git: GitSnapshot,
     evals: Vec<EvalRecord>,
     metrics: RunMetrics,
+    #[serde(default)]
+    llm_error_calls: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,6 +244,7 @@ struct ProxyRunConfig {
     upstream: String,
     api_key_env: Option<String>,
     record_bodies: bool,
+    fail_on_llm_error: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -303,6 +306,8 @@ enum Commands {
         proxy_api_key_env: Option<String>,
         #[arg(long)]
         proxy_record_bodies: bool,
+        #[arg(long)]
+        fail_on_llm_error: bool,
         #[arg(last = true, required = true)]
         command: Vec<OsString>,
     },
@@ -401,6 +406,7 @@ fn run_task(
     proxy_bind: Option<String>,
     proxy_api_key_env: Option<String>,
     proxy_record_bodies: Option<bool>,
+    fail_on_llm_error: Option<bool>,
 ) -> PyResult<String> {
     let repo = repo.unwrap_or_else(|| ".".to_string());
     let proxy_config = proxy_upstream.map(|upstream| ProxyRunConfig {
@@ -408,6 +414,7 @@ fn run_task(
         upstream,
         api_key_env: proxy_api_key_env,
         record_bodies: proxy_record_bodies.unwrap_or(false),
+        fail_on_llm_error: fail_on_llm_error.unwrap_or(false),
     });
     // Release the GIL: the captured command or the proxy may call back into
     // Python-hosted servers running in other threads of this process.
@@ -557,6 +564,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             proxy_bind,
             proxy_api_key_env,
             proxy_record_bodies,
+            fail_on_llm_error,
             command,
         } => {
             let command = command
@@ -568,6 +576,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 upstream,
                 api_key_env: proxy_api_key_env,
                 record_bodies: proxy_record_bodies,
+                fail_on_llm_error,
             });
             let record = run_capture(
                 &task,
@@ -759,7 +768,15 @@ fn run_capture(
     let output = child
         .output()
         .map_err(|err| Error::Capture(format!("failed to run {:?}: {err}", command)))?;
+    // Dropping the handle joins the proxy thread, so the error counter is
+    // final once the drop returns.
+    let llm_error_counter = proxy_handle
+        .as_ref()
+        .map(|handle| handle.error_calls_handle());
     drop(proxy_handle);
+    let llm_error_calls = llm_error_counter
+        .map(|counter| counter.load(std::sync::atomic::Ordering::SeqCst))
+        .unwrap_or(0);
     let duration_ms = timer.elapsed().as_millis();
     let ended_at = now_rfc3339()?;
 
@@ -773,7 +790,11 @@ fn run_capture(
         .collect::<Result<Vec<_>>>()?;
 
     let eval_failed = evals.iter().any(|eval| eval.status != "passed");
-    let status = if output.status.success() && !eval_failed {
+    let fail_on_llm_error = proxy_config
+        .as_ref()
+        .is_some_and(|config| config.fail_on_llm_error);
+    let llm_failed = fail_on_llm_error && llm_error_calls > 0;
+    let status = if output.status.success() && !eval_failed && !llm_failed {
         "passed"
     } else {
         "failed"
@@ -813,6 +834,7 @@ fn run_capture(
             ttft_ms: None,
             output_tokens_per_second: None,
         },
+        llm_error_calls,
     };
 
     append_run_event(&ledger_dir, &record)?;
@@ -848,6 +870,8 @@ struct BenchMatrix {
     repeats: u32,
     #[serde(default)]
     allow_dirty: bool,
+    #[serde(default)]
+    fail_on_llm_error: bool,
     tasks: Vec<BenchTask>,
     agents: Vec<BenchAgent>,
     #[serde(default)]
@@ -990,6 +1014,7 @@ fn run_bench(matrix_path: &Path, repo: &Path, task_filter: Option<&str>) -> Resu
                         upstream: provider.upstream.clone(),
                         api_key_env: provider.api_key_env.clone(),
                         record_bodies: provider.record_bodies,
+                        fail_on_llm_error: matrix.fail_on_llm_error,
                     });
                     let cell = match run_capture(
                         &task.name,
@@ -1788,6 +1813,7 @@ mod tests {
             },
             evals: vec![],
             metrics: RunMetrics::default(),
+            llm_error_calls: 0,
         }
     }
 

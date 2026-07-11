@@ -11,6 +11,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::TcpListener as StdTcpListener;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
@@ -27,17 +28,24 @@ struct ProxyState {
     api_key: Option<String>,
     record_bodies: bool,
     default_run_id: Option<String>,
+    // Calls that failed (HTTP >= 400 or unreachable upstream), shared with ProxyHandle.
+    error_calls: Arc<AtomicU64>,
 }
 
 pub struct ProxyHandle {
     base_url: String,
     shutdown: Option<oneshot::Sender<()>>,
     thread: Option<JoinHandle<()>>,
+    error_calls: Arc<AtomicU64>,
 }
 
 impl ProxyHandle {
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    pub fn error_calls_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.error_calls)
     }
 }
 
@@ -119,6 +127,8 @@ pub fn start_proxy_background(
     let upstream_base = upstream_base.trim_end_matches('/').to_string();
     let root = root.to_path_buf();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let error_calls = Arc::new(AtomicU64::new(0));
+    let error_calls_worker = Arc::clone(&error_calls);
 
     let thread = thread::spawn(move || {
         let runtime = match tokio::runtime::Runtime::new() {
@@ -138,6 +148,7 @@ pub fn start_proxy_background(
                 api_key,
                 record_bodies,
                 default_run_id,
+                error_calls_worker,
                 Some(shutdown_rx),
             )
             .await
@@ -150,6 +161,7 @@ pub fn start_proxy_background(
         base_url,
         shutdown: Some(shutdown_tx),
         thread: Some(thread),
+        error_calls,
     })
 }
 
@@ -172,11 +184,13 @@ async fn serve_proxy_async(
         api_key,
         record_bodies,
         default_run_id,
+        Arc::new(AtomicU64::new(0)),
         None,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_proxy_server(
     listener: tokio::net::TcpListener,
     upstream_base: String,
@@ -184,9 +198,17 @@ async fn run_proxy_server(
     api_key: Option<String>,
     record_bodies: bool,
     default_run_id: Option<String>,
+    error_calls: Arc<AtomicU64>,
     shutdown: Option<oneshot::Receiver<()>>,
 ) -> Result<(), String> {
-    let state = build_state(upstream_base, root, api_key, record_bodies, default_run_id)?;
+    let state = build_state(
+        upstream_base,
+        root,
+        api_key,
+        record_bodies,
+        default_run_id,
+        error_calls,
+    )?;
     let app = proxy_router(state.clone());
     let address = listener.local_addr().map_err(|err| err.to_string())?;
     println!("AgentLedger OpenAI-compatible proxy: http://{address}/v1");
@@ -211,6 +233,7 @@ fn build_state(
     api_key: Option<String>,
     record_bodies: bool,
     default_run_id: Option<String>,
+    error_calls: Arc<AtomicU64>,
 ) -> Result<Arc<ProxyState>, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(600))
@@ -224,6 +247,7 @@ fn build_state(
         api_key,
         record_bodies,
         default_run_id,
+        error_calls,
     }))
 }
 
@@ -268,12 +292,16 @@ async fn forward_openai_endpoint(
     let response = match request.send().await {
         Ok(response) => response,
         Err(err) => {
+            state.error_calls.fetch_add(1, Ordering::SeqCst);
             let body = format!("upstream request failed: {err}");
             return (StatusCode::BAD_GATEWAY, body).into_response();
         }
     };
 
     let status = response.status();
+    if status.as_u16() >= 400 {
+        state.error_calls.fetch_add(1, Ordering::SeqCst);
+    }
     let response_headers = response.headers().clone();
 
     if is_event_stream(&response_headers) {
@@ -292,6 +320,9 @@ async fn forward_openai_endpoint(
     let response_bytes = match response.bytes().await {
         Ok(bytes) => bytes,
         Err(err) => {
+            if status.as_u16() < 400 {
+                state.error_calls.fetch_add(1, Ordering::SeqCst);
+            }
             let body = format!("upstream response read failed: {err}");
             return (StatusCode::BAD_GATEWAY, body).into_response();
         }
@@ -344,6 +375,7 @@ fn stream_openai_response(
     let record_bodies = state.record_bodies;
     let upstream_base = state.upstream_base.clone();
     let ledger_root = state.ledger_root.clone();
+    let error_calls = Arc::clone(&state.error_calls);
     let status_code = status.as_u16();
 
     tokio::spawn(async move {
@@ -359,6 +391,9 @@ fn stream_openai_response(
                     }
                 }
                 Err(err) => {
+                    if status_code < 400 {
+                        error_calls.fetch_add(1, Ordering::SeqCst);
+                    }
                     if client_connected {
                         let _ = tx.send(Err(std::io::Error::other(err.to_string()))).await;
                     }
@@ -963,6 +998,54 @@ mod tests {
         );
         assert_eq!(collector.delta_count, 1);
         assert!(collector.ttft_ms.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_counts_upstream_error_calls() {
+        let upstream_app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "{\"error\":\"rate limited\"}",
+                )
+            }),
+        );
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let upstream_address = upstream_listener.local_addr().expect("upstream addr");
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app)
+                .await
+                .expect("upstream serve");
+        });
+
+        let root = std::env::temp_dir().join(format!("agentledger-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create test root");
+        let proxy = start_proxy_background(
+            "127.0.0.1:0",
+            &format!("http://{upstream_address}/v1"),
+            &root,
+            None,
+            false,
+            None,
+        )
+        .expect("start proxy");
+        let errors = proxy.error_calls_handle();
+
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("{}/chat/completions", proxy.base_url()))
+            .json(&serde_json::json!({"model": "mock"}))
+            .send()
+            .await
+            .expect("proxy request");
+        assert_eq!(response.status().as_u16(), 429);
+
+        drop(proxy);
+        assert_eq!(errors.load(Ordering::SeqCst), 1);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread")]

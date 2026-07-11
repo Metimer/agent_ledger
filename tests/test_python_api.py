@@ -176,6 +176,74 @@ upstream = "http://127.0.0.1:9/v1"
     assert all("http://127.0.0.1" in stdout for stdout in greet_outputs)  # proxy URL injected
 
 
+class MockRateLimitedHandler(BaseHTTPRequestHandler):
+    def do_POST(self) -> None:
+        length = int(self.headers.get("content-length", "0"))
+        self.rfile.read(length)
+        payload = b'{"error": {"code": 429, "message": "rate limited"}}'
+        self.send_response(429)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+        return
+
+
+def test_fail_on_llm_error_marks_run_failed(tmp_path: Path) -> None:
+    init_git_repo(tmp_path)
+
+    server = HTTPServer(("127.0.0.1", 0), MockRateLimitedHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    script = """
+import json
+import os
+import urllib.request
+import urllib.error
+
+payload = json.dumps({"model": "mock", "messages": []}).encode("utf-8")
+request = urllib.request.Request(
+    os.environ["OPENAI_BASE_URL"] + "/chat/completions",
+    data=payload,
+    headers={"content-type": "application/json"},
+    method="POST",
+)
+try:
+    urllib.request.urlopen(request, timeout=5)
+except urllib.error.HTTPError as exc:
+    print("upstream said", exc.code)
+"""
+
+    try:
+        strict = agentledger.run(
+            task="llm-guard-strict",
+            agent="custom",
+            command=[sys.executable, "-c", script],
+            repo=tmp_path,
+            proxy_upstream=f"http://127.0.0.1:{server.server_port}/v1",
+            fail_on_llm_error=True,
+        )
+        lenient = agentledger.run(
+            task="llm-guard-lenient",
+            agent="custom",
+            command=[sys.executable, "-c", script],
+            repo=tmp_path,
+            proxy_upstream=f"http://127.0.0.1:{server.server_port}/v1",
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+    # The child exits 0 in both cases; only the strict run is failed by the guard.
+    assert strict.data["llm_error_calls"] == 1
+    assert strict.status == "failed"
+    assert lenient.data["llm_error_calls"] == 1
+    assert lenient.status == "passed"
+
+
 def test_post_hoc_eval_updates_existing_run(tmp_path: Path) -> None:
     init_git_repo(tmp_path)
     agentledger.init(tmp_path)

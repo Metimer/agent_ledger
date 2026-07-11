@@ -45,6 +45,8 @@ When `agentledger run` launches a command, it injects `AGENTLEDGER_RUN_ID`, `AGE
 
 Streaming (`stream: true`) responses are relayed chunk-by-chunk; the proxy records time-to-first-token (`ttft_ms`) and output tokens/s per call. Token counts come from the final `usage` chunk when the provider sends one (`source_precision: "exact"`), otherwise they are estimated from the number of content deltas (`source_precision: "estimated"`).
 
+Every run records `llm_error_calls`, the number of proxied calls that failed (HTTP >= 400 or unreachable upstream). Clients like `curl` exit 0 on an HTTP 429, so a run can look `passed` while its LLM calls failed; pass `--fail-on-llm-error` (CLI/Python) or set `fail_on_llm_error = true` in a bench matrix to mark such runs `failed`.
+
 ## Benchmark matrices
 
 `agentledger bench --matrix bench.toml [--repo .] [--task name]` runs every task × agent × provider × repeat combination through the same capture pipeline as `agentledger run`, then prints a JSON report with one cell per run. `{prompt}` and `{task}` placeholders in agent commands are substituted per task; each provider starts a loopback proxy so LLM calls are attached to their run. Cells keep executing even when one fails.
@@ -52,6 +54,7 @@ Streaming (`stream: true`) responses are relayed chunk-by-chunk; the proxy recor
 ```toml
 repeats = 2
 allow_dirty = true
+fail_on_llm_error = true
 
 [[tasks]]
 name = "fix-bug"
