@@ -137,18 +137,51 @@ agentledger run --task llm-stream --allow-dirty --proxy-upstream http://127.0.0.
 
 Arrêter le mock : `kill %1`.
 
-### 7b. (Optionnel) Avec Ollama réel
+### 7b. (Optionnel) Avec un provider réel — OpenRouter (aucun GPU requis)
+
+Prérequis : une clé sur openrouter.ai. Les modèles suffixés `:free` ne coûtent rien ; pour en lister :
 
 ```bash
-agentledger proxy --upstream http://127.0.0.1:11434/v1 &
+curl -sS https://openrouter.ai/api/v1/models | python3 -c "import json,sys; [print(m['id']) for m in json.load(sys.stdin)['data'] if m['id'].endswith(':free')]" | head
+export OPENROUTER_API_KEY=sk-or-...
+MODEL="meta-llama/llama-3.3-8b-instruct:free"   # ou un autre id de la liste
+```
+
+**Proxy autonome** — la clé est injectée par le proxy (le client n'en a pas besoin) :
+
+```bash
+agentledger proxy --upstream https://openrouter.ai/api/v1 --api-key-env OPENROUTER_API_KEY &
 # noter le port affiché, puis :
 curl -sS -N -X POST http://127.0.0.1:<port>/v1/chat/completions \
   -H "content-type: application/json" \
-  -d '{"model":"qwen2.5:0.5b","stream":true,"messages":[{"role":"user","content":"Dis bonjour"}]}'
+  -d "{\"model\":\"$MODEL\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"usage\":{\"include\":true},\"messages\":[{\"role\":\"user\",\"content\":\"Dis bonjour en un mot\"}]}"
 kill %1
 ```
 
-**Attendu** : les tokens s'affichent **au fil de l'eau** (pas d'un bloc à la fin) ; le dernier enregistrement de `llm_calls.ndjson` a `ttft_ms` > 0 et des compteurs de tokens (exacts si Ollama envoie `usage`, sinon `source_precision: "estimated"`).
+**Attendu** : les tokens s'affichent **au fil de l'eau** (pas d'un bloc à la fin) ; le dernier enregistrement de `llm_calls.ndjson` a `ttft_ms` > 0 (typiquement 300–2000 ms selon le modèle), `source_precision: "exact"` (grâce au chunk `usage` final demandé par `stream_options`/`usage`), et `cost_usd` renseigné (0.0 pour un modèle `:free`). Sans ces options de requête, OpenRouter peut omettre `usage` → repli `source_precision: "estimated"` avec `output_tokens` ≈ nombre de deltas.
+
+**Run intégré** — mêmes métriques, rattachées à un run :
+
+```bash
+agentledger run --task or-smoke --allow-dirty \
+  --proxy-upstream https://openrouter.ai/api/v1 \
+  --proxy-api-key-env OPENROUTER_API_KEY -- \
+  sh -c "curl -sS -X POST \"\$OPENAI_BASE_URL/chat/completions\" -H 'content-type: application/json' -d '{\"model\":\"$MODEL\",\"usage\":{\"include\":true},\"messages\":[{\"role\":\"user\",\"content\":\"Dis bonjour\"}]}'"
+agentledger compare or-smoke
+```
+
+**Attendu** : `compare or-smoke` → 1 run avec `token_total` > 0, `llm_call_count: 1`, `llm_metrics_precision: "exact"`. Le process enfant reçoit `OPENAI_BASE_URL` (pointant sur le proxy local) et un `OPENAI_API_KEY` placeholder — la vraie clé n'est jamais exposée au process capturé, c'est le proxy qui la substitue.
+
+**Bench avec l'axe provider** : ajouter au `bench.toml` de l'étape 8 :
+
+```toml
+[[providers]]
+name = "openrouter"
+upstream = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+```
+
+Les cellules apparaissent alors avec `"agent": "echo@openrouter"` et chaque run a son proxy dédié.
 
 ## 8. Bench matrix
 
