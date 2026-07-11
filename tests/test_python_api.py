@@ -20,6 +20,27 @@ def init_git_repo(path: Path) -> None:
 
 
 
+class MockStreamingOpenAIHandler(BaseHTTPRequestHandler):
+    def do_POST(self) -> None:
+        length = int(self.headers.get("content-length", "0"))
+        self.rfile.read(length)
+        chunks = [
+            b'data: {"model":"mock-model","choices":[{"delta":{"content":"Hel"}}]}\n\n',
+            b'data: {"choices":[{"delta":{"content":"lo"}}]}\n\n',
+            b'data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":5,"total_tokens":16}}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.end_headers()
+        for chunk in chunks:
+            self.wfile.write(chunk)
+            self.wfile.flush()
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+        return
+
+
 class MockOpenAICompatibleHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         length = int(self.headers.get("content-length", "0"))
@@ -171,4 +192,60 @@ print(urllib.request.urlopen(request, timeout=5).read().decode("utf-8"))
     row = report.data["runs"][0]
     assert row["token_total"] == 16
     assert row["llm_call_count"] == 1
+    assert row["llm_metrics_precision"] == "exact"
+
+
+def test_run_with_streaming_proxy_records_ttft(tmp_path: Path) -> None:
+    init_git_repo(tmp_path)
+
+    server = HTTPServer(("127.0.0.1", 0), MockStreamingOpenAIHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    script = """
+import json
+import os
+import urllib.request
+
+payload = json.dumps({
+    "model": "mock-model",
+    "stream": True,
+    "messages": [{"role": "user", "content": "hello"}],
+}).encode("utf-8")
+request = urllib.request.Request(
+    os.environ["OPENAI_BASE_URL"] + "/chat/completions",
+    data=payload,
+    headers={"content-type": "application/json"},
+    method="POST",
+)
+body = urllib.request.urlopen(request, timeout=5).read().decode("utf-8")
+assert "data: [DONE]" in body, body
+print(body)
+"""
+
+    try:
+        result = agentledger.run(
+            task="proxy-stream",
+            agent="custom",
+            command=[sys.executable, "-c", script],
+            repo=tmp_path,
+            proxy_upstream=f"http://127.0.0.1:{server.server_port}/v1",
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+    assert result.status == "passed"
+    assert "Hel" in result.data["stdout_preview"]
+
+    calls_path = tmp_path / ".agentledger" / "llm_calls.ndjson"
+    record = json.loads(calls_path.read_text(encoding="utf-8").strip().splitlines()[0])
+    assert record["run_id"] == result.id
+    assert record["source_precision"] == "exact"
+    assert record["metrics"]["total_tokens"] == 16
+    assert record["metrics"]["ttft_ms"] is not None
+
+    report = agentledger.compare(task="proxy-stream", root=tmp_path)
+    row = report.data["runs"][0]
+    assert row["token_total"] == 16
     assert row["llm_metrics_precision"] == "exact"

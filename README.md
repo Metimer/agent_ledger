@@ -20,9 +20,10 @@ Current MVP capabilities:
 - open a token-protected local dashboard on `127.0.0.1`;
 - use a Python API around the same native core;
 - run a loopback OpenAI-compatible proxy that records LLM call metrics in `.agentledger/llm_calls.ndjson`;
-- launch the proxy automatically inside `agentledger run` and attach calls to the captured run.
+- launch the proxy automatically inside `agentledger run` and attach calls to the captured run;
+- stream Server-Sent Events responses through the proxy while recording TTFT and output tokens/s.
 
-Planned next layers are streaming-first proxy replay, matrix benchmarks, Parquet/DuckDB analytics and OTLP export.
+Planned next layers are matrix benchmarks, proxy replay, Parquet/DuckDB analytics and OTLP export.
 
 ## Quickstart
 
@@ -37,6 +38,8 @@ agentledger dashboard
 ```
 
 When `agentledger run` launches a command, it injects `AGENTLEDGER_RUN_ID`, `AGENTLEDGER_ROOT`, and `AGENTLEDGER_PROXY_RUN_HEADER`. With `--proxy-upstream`, it also starts a loopback proxy, injects `OPENAI_BASE_URL`, `OPENAI_API_BASE`, and `AGENTLEDGER_PROXY_URL`, then links every proxied call to the run automatically. Clients that send the `x-agentledger-run-id` header through a separately launched proxy are still aggregated into `agentledger compare`.
+
+Streaming (`stream: true`) responses are relayed chunk-by-chunk; the proxy records time-to-first-token (`ttft_ms`) and output tokens/s per call. Token counts come from the final `usage` chunk when the provider sends one (`source_precision: "exact"`), otherwise they are estimated from the number of content deltas (`source_precision: "estimated"`).
 
 Python:
 

@@ -1373,3 +1373,149 @@ fn secure_dir(path: &Path) -> Result<()> {
 fn secure_dir(_path: &Path) -> Result<()> {
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_root() -> PathBuf {
+        let root = std::env::temp_dir().join(format!("agentledger-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join(".agentledger")).expect("create test ledger");
+        root
+    }
+
+    #[test]
+    fn default_config_roundtrips_through_toml() {
+        let config = AgentLedgerConfig::default();
+        let rendered = toml::to_string_pretty(&config).expect("serialize config");
+        let parsed: AgentLedgerConfig = toml::from_str(&rendered).expect("parse config");
+        assert_eq!(parsed.storage.root, ".agentledger");
+        assert!(!parsed.proxy.enabled);
+        assert!(parsed.agents.contains_key("claude-code"));
+        assert_eq!(
+            parsed.providers["ollama"].base_url.as_deref(),
+            Some("http://127.0.0.1:11434/v1")
+        );
+    }
+
+    #[test]
+    fn ledger_artifacts_are_ignored_in_git_status() {
+        assert!(is_ledger_artifact_status("?? AgentLedger.toml"));
+        assert!(is_ledger_artifact_status("?? .agentledger/"));
+        assert!(is_ledger_artifact_status(" M .agentledger/runs/x/stdout.txt"));
+        assert!(!is_ledger_artifact_status(" M src/main.rs"));
+    }
+
+    #[test]
+    fn add_helpers_accumulate_optional_values() {
+        let mut target = None;
+        add_u64(&mut target, None);
+        assert_eq!(target, None);
+        add_u64(&mut target, Some(3));
+        add_u64(&mut target, Some(4));
+        assert_eq!(target, Some(7));
+
+        let mut cost = None;
+        add_f64(&mut cost, Some(0.5));
+        add_f64(&mut cost, Some(0.25));
+        assert_eq!(cost, Some(0.75));
+
+        assert_eq!(min_u128(None, None), None);
+        assert_eq!(min_u128(Some(5), None), Some(5));
+        assert_eq!(min_u128(None, Some(9)), Some(9));
+        assert_eq!(min_u128(Some(5), Some(9)), Some(5));
+    }
+
+    #[test]
+    fn csv_escape_quotes_special_characters() {
+        assert_eq!(csv_escape("plain"), "plain");
+        assert_eq!(csv_escape("a,b"), "\"a,b\"");
+        assert_eq!(csv_escape("say \"hi\""), "\"say \"\"hi\"\"\"");
+    }
+
+    #[test]
+    fn preview_bytes_truncates_long_output() {
+        assert_eq!(preview_bytes(b"short"), "short");
+        let long = "x".repeat(3000);
+        let preview = preview_bytes(long.as_bytes());
+        assert!(preview.ends_with("[truncated]"));
+        assert!(preview.chars().count() < 2100);
+    }
+
+    #[test]
+    fn llm_aggregates_sum_tokens_and_keep_min_ttft() {
+        let root = temp_root();
+        let calls = root.join(".agentledger").join("llm_calls.ndjson");
+        let lines = [
+            serde_json::json!({
+                "run_id": "run-1",
+                "duration_ms": 1000,
+                "metrics": {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10, "cost_usd": 0.001, "ttft_ms": 200}
+            }),
+            serde_json::json!({
+                "run_id": "run-1",
+                "duration_ms": 1000,
+                "metrics": {"input_tokens": 5, "output_tokens": 5, "total_tokens": 10, "cost_usd": 0.002, "ttft_ms": 120}
+            }),
+            serde_json::json!({
+                "run_id": null,
+                "duration_ms": 50,
+                "metrics": {"output_tokens": 99}
+            }),
+        ];
+        fs::write(
+            &calls,
+            lines
+                .iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .expect("write llm calls");
+
+        let aggregates = load_llm_metric_aggregates(&root).expect("aggregate");
+        assert_eq!(aggregates.len(), 1);
+        let aggregate = &aggregates["run-1"];
+        assert_eq!(aggregate.call_count, 2);
+        assert_eq!(aggregate.metrics.token_input, Some(12));
+        assert_eq!(aggregate.metrics.token_output, Some(8));
+        assert_eq!(aggregate.metrics.token_total, Some(20));
+        assert_eq!(aggregate.metrics.cost_usd, Some(0.003));
+        assert_eq!(aggregate.metrics.ttft_ms, Some(120));
+        assert_eq!(aggregate.metrics.output_tokens_per_second, Some(4.0));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn merge_run_metrics_prefers_aggregate_values() {
+        let base = RunMetrics {
+            llm_metrics_precision: "unknown".to_string(),
+            ..RunMetrics::default()
+        };
+        assert_eq!(
+            merge_run_metrics(&base, None).llm_metrics_precision,
+            "unknown"
+        );
+
+        let aggregate = LlmMetricAggregate {
+            call_count: 2,
+            duration_ms: 1000,
+            metrics: RunMetrics {
+                llm_metrics_precision: "exact".to_string(),
+                token_input: Some(12),
+                token_output: Some(8),
+                token_total: Some(20),
+                cost_usd: Some(0.003),
+                ttft_ms: Some(120),
+                output_tokens_per_second: Some(8.0),
+                ..RunMetrics::default()
+            },
+        };
+        let merged = merge_run_metrics(&base, Some(&aggregate));
+        assert_eq!(merged.llm_metrics_precision, "exact");
+        assert_eq!(merged.token_total, Some(20));
+        assert_eq!(merged.ttft_ms, Some(120));
+        assert_eq!(merged.output_tokens_per_second, Some(8.0));
+    }
+}
