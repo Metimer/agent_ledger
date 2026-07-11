@@ -121,6 +121,61 @@ def test_init_run_compare_export(tmp_path: Path) -> None:
     assert output.exists()
 
 
+def test_bench_matrix_runs_cross_product(tmp_path: Path) -> None:
+    init_git_repo(tmp_path)
+    agentledger.init(tmp_path)
+
+    matrix = tmp_path / "bench.toml"
+    matrix.write_text(
+        f"""
+repeats = 2
+allow_dirty = true
+
+[[tasks]]
+name = "greet"
+prompt = "hello"
+evals = ["test -f README.md"]
+
+[[tasks]]
+name = "env-check"
+
+[[agents]]
+name = "echo"
+command = ["{sys.executable}", "-c", "import os; print('{{prompt}}', '{{task}}', os.environ.get('OPENAI_BASE_URL', 'no-proxy'))"]
+
+[[providers]]
+name = "mock"
+upstream = "http://127.0.0.1:9/v1"
+""",
+        encoding="utf-8",
+    )
+
+    report = agentledger.bench(matrix=matrix, repo=tmp_path)
+    assert report.cell_count == 4
+    assert report.passed == 4
+    assert report.failed == 0
+    cells = report.data["cells"]
+    assert {cell["agent"] for cell in cells} == {"echo@mock"}
+    assert {cell["repeat"] for cell in cells} == {1, 2}
+
+    compared = agentledger.compare(task="greet", root=tmp_path)
+    assert compared.run_count == 2
+    row = compared.data["runs"][0]
+    assert row["agent"] == "echo@mock"
+    assert row["eval_status"] == "passed"
+
+    filtered = agentledger.bench(matrix=matrix, repo=tmp_path, task="env-check")
+    assert filtered.cell_count == 2
+
+    stdouts = [
+        (run_dir / "stdout.txt").read_text(encoding="utf-8")
+        for run_dir in (tmp_path / ".agentledger" / "runs").iterdir()
+    ]
+    greet_outputs = [stdout for stdout in stdouts if "hello greet" in stdout]
+    assert greet_outputs
+    assert all("http://127.0.0.1" in stdout for stdout in greet_outputs)  # proxy URL injected
+
+
 def test_doctor(tmp_path: Path) -> None:
     text = agentledger.doctor(tmp_path)
     assert "AgentLedger" in text

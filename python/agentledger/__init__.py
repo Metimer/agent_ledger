@@ -40,6 +40,29 @@ class RunResult:
 
 
 @dataclass(frozen=True)
+class BenchReport:
+    data: dict[str, Any]
+
+    @property
+    def cell_count(self) -> int:
+        return int(self.data["cell_count"])
+
+    @property
+    def passed(self) -> int:
+        return int(self.data["passed"])
+
+    @property
+    def failed(self) -> int:
+        return int(self.data["failed"])
+
+    def to_dict(self) -> dict[str, Any]:
+        return dict(self.data)
+
+    def to_json(self, *, indent: int = 2) -> str:
+        return json.dumps(self.data, indent=indent)
+
+
+@dataclass(frozen=True)
 class CompareReport:
     data: dict[str, Any]
 
@@ -116,6 +139,9 @@ class AgentLedger:
             proxy_record_bodies=proxy_record_bodies,
         )
 
+    def bench(self, *, matrix: str | Path, task: str | None = None) -> BenchReport:
+        return bench(matrix=matrix, repo=self.root, task=task)
+
     def compare(self, task: str | None = None) -> CompareReport:
         return compare(task=task, root=self.root)
 
@@ -163,8 +189,14 @@ def run(
     return RunResult(json.loads(payload))
 
 
-def bench(*args: Any, **kwargs: Any) -> None:
-    raise NotImplementedError("bench matrix execution will land after the capture MVP")
+def bench(
+    *,
+    matrix: str | Path,
+    repo: str | Path = ".",
+    task: str | None = None,
+) -> BenchReport:
+    payload = _native.bench_matrix(str(matrix), str(repo), task)
+    return BenchReport(json.loads(payload))
 
 
 def compare(task: str | None = None, root: str | Path = ".") -> CompareReport:
@@ -211,6 +243,7 @@ def doctor(root: str | Path = ".") -> str:
 __all__ = [
     "AgentLedger",
     "AgentLedgerError",
+    "BenchReport",
     "CaptureError",
     "CompareReport",
     "ConfigError",

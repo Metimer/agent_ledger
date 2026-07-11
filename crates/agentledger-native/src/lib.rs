@@ -309,8 +309,10 @@ enum Commands {
     Bench {
         #[arg(long)]
         matrix: PathBuf,
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
         #[arg(long)]
-        task: PathBuf,
+        task: Option<String>,
     },
     Compare {
         task: Option<String>,
@@ -424,6 +426,20 @@ fn run_task(
 }
 
 #[pyfunction]
+fn bench_matrix(
+    py: Python<'_>,
+    matrix: String,
+    repo: Option<String>,
+    task: Option<String>,
+) -> PyResult<String> {
+    let repo = repo.unwrap_or_else(|| ".".to_string());
+    let report = py
+        .detach(move || run_bench(Path::new(&matrix), Path::new(&repo), task.as_deref()))
+        .map_err(to_py_err)?;
+    serde_json::to_string_pretty(&report).map_err(|err| to_py_err(Error::Json(err)))
+}
+
+#[pyfunction]
 fn compare_runs(task: Option<String>, root: Option<String>) -> PyResult<String> {
     let root = root.unwrap_or_else(|| ".".to_string());
     let report = compare(task, Path::new(&root)).map_err(to_py_err)?;
@@ -500,6 +516,7 @@ fn _native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(init_project, m)?)?;
     m.add_function(wrap_pyfunction!(run_task, m)?)?;
+    m.add_function(wrap_pyfunction!(bench_matrix, m)?)?;
     m.add_function(wrap_pyfunction!(compare_runs, m)?)?;
     m.add_function(wrap_pyfunction!(export_ledger, m)?)?;
     m.add_function(wrap_pyfunction!(doctor, m)?)?;
@@ -546,12 +563,9 @@ fn dispatch(cli: Cli) -> Result<()> {
             )?;
             println!("{}", serde_json::to_string_pretty(&record)?);
         }
-        Commands::Bench { matrix, task } => {
-            return Err(Error::Unsupported(format!(
-                "bench matrix execution is planned after the capture MVP (matrix: {}, task: {})",
-                matrix.display(),
-                task.display()
-            )));
+        Commands::Bench { matrix, repo, task } => {
+            let report = run_bench(&matrix, &repo, task.as_deref())?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Commands::Compare { task, root } => {
             let report = compare(task, &root)?;
@@ -805,6 +819,202 @@ fn run_eval(command: &str, repo: &Path) -> Result<EvalRecord> {
         },
         stdout_preview: preview_bytes(&output.stdout),
         stderr_preview: preview_bytes(&output.stderr),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct BenchMatrix {
+    #[serde(default = "default_repeats")]
+    repeats: u32,
+    #[serde(default)]
+    allow_dirty: bool,
+    tasks: Vec<BenchTask>,
+    agents: Vec<BenchAgent>,
+    #[serde(default)]
+    providers: Vec<BenchProvider>,
+}
+
+fn default_repeats() -> u32 {
+    1
+}
+
+#[derive(Debug, Deserialize)]
+struct BenchTask {
+    name: String,
+    #[serde(default)]
+    prompt: String,
+    #[serde(default)]
+    evals: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BenchAgent {
+    name: String,
+    command: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BenchProvider {
+    name: String,
+    upstream: String,
+    #[serde(default)]
+    api_key_env: Option<String>,
+    #[serde(default = "default_proxy_bind")]
+    bind: String,
+    #[serde(default)]
+    record_bodies: bool,
+}
+
+fn default_proxy_bind() -> String {
+    "127.0.0.1:0".to_string()
+}
+
+#[derive(Debug, Serialize)]
+struct BenchReport {
+    schema_version: u32,
+    matrix: String,
+    cell_count: usize,
+    passed: usize,
+    failed: usize,
+    cells: Vec<BenchCell>,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchCell {
+    task: String,
+    agent: String,
+    provider: Option<String>,
+    repeat: u32,
+    run_id: Option<String>,
+    status: String,
+    duration_ms: Option<u128>,
+    error: Option<String>,
+}
+
+fn parse_bench_matrix(raw: &str) -> Result<BenchMatrix> {
+    let matrix: BenchMatrix =
+        toml::from_str(raw).map_err(|err| Error::Config(format!("invalid bench matrix: {err}")))?;
+    if matrix.tasks.is_empty() {
+        return Err(Error::Config(
+            "bench matrix needs at least one [[tasks]] entry".to_string(),
+        ));
+    }
+    if matrix.agents.is_empty() {
+        return Err(Error::Config(
+            "bench matrix needs at least one [[agents]] entry".to_string(),
+        ));
+    }
+    for agent in &matrix.agents {
+        if agent.command.is_empty() {
+            return Err(Error::Config(format!(
+                "bench agent '{}' has an empty command",
+                agent.name
+            )));
+        }
+    }
+    Ok(matrix)
+}
+
+fn bench_command(template: &[String], task: &BenchTask) -> Vec<String> {
+    template
+        .iter()
+        .map(|part| {
+            part.replace("{prompt}", &task.prompt)
+                .replace("{task}", &task.name)
+        })
+        .collect()
+}
+
+fn run_bench(matrix_path: &Path, repo: &Path, task_filter: Option<&str>) -> Result<BenchReport> {
+    let raw = fs::read_to_string(matrix_path).map_err(|err| {
+        Error::Config(format!(
+            "cannot read bench matrix {}: {err}",
+            matrix_path.display()
+        ))
+    })?;
+    let matrix = parse_bench_matrix(&raw)?;
+    let tasks = matrix
+        .tasks
+        .iter()
+        .filter(|task| task_filter.is_none_or(|filter| task.name == filter))
+        .collect::<Vec<_>>();
+    if tasks.is_empty() {
+        return Err(Error::Config(format!(
+            "no bench task matches filter '{}'",
+            task_filter.unwrap_or_default()
+        )));
+    }
+    let providers = if matrix.providers.is_empty() {
+        vec![None]
+    } else {
+        matrix.providers.iter().map(Some).collect::<Vec<_>>()
+    };
+    let repeats = matrix.repeats.max(1);
+
+    let mut cells = Vec::new();
+    for task in &tasks {
+        for agent in &matrix.agents {
+            for provider in &providers {
+                let agent_label = match provider {
+                    Some(provider) => format!("{}@{}", agent.name, provider.name),
+                    None => agent.name.clone(),
+                };
+                for repeat in 1..=repeats {
+                    eprintln!(
+                        "bench: task={} agent={} repeat={repeat}/{repeats}",
+                        task.name, agent_label
+                    );
+                    let command = bench_command(&agent.command, task);
+                    let proxy_config = provider.map(|provider| ProxyRunConfig {
+                        bind: provider.bind.clone(),
+                        upstream: provider.upstream.clone(),
+                        api_key_env: provider.api_key_env.clone(),
+                        record_bodies: provider.record_bodies,
+                    });
+                    let cell = match run_capture(
+                        &task.name,
+                        &agent_label,
+                        command,
+                        repo,
+                        task.evals.clone(),
+                        matrix.allow_dirty,
+                        proxy_config,
+                    ) {
+                        Ok(record) => BenchCell {
+                            task: task.name.clone(),
+                            agent: agent_label.clone(),
+                            provider: provider.map(|provider| provider.name.clone()),
+                            repeat,
+                            run_id: Some(record.id),
+                            status: record.status,
+                            duration_ms: Some(record.duration_ms),
+                            error: None,
+                        },
+                        Err(err) => BenchCell {
+                            task: task.name.clone(),
+                            agent: agent_label.clone(),
+                            provider: provider.map(|provider| provider.name.clone()),
+                            repeat,
+                            run_id: None,
+                            status: "error".to_string(),
+                            duration_ms: None,
+                            error: Some(err.to_string()),
+                        },
+                    };
+                    cells.push(cell);
+                }
+            }
+        }
+    }
+
+    let passed = cells.iter().filter(|cell| cell.status == "passed").count();
+    Ok(BenchReport {
+        schema_version: SCHEMA_VERSION,
+        matrix: matrix_path.display().to_string(),
+        cell_count: cells.len(),
+        passed,
+        failed: cells.len() - passed,
+        cells,
     })
 }
 
@@ -1485,6 +1695,58 @@ mod tests {
         assert_eq!(aggregate.metrics.output_tokens_per_second, Some(4.0));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bench_matrix_parses_with_defaults() {
+        let matrix = parse_bench_matrix(
+            r#"
+[[tasks]]
+name = "smoke"
+prompt = "say ok"
+evals = ["true"]
+
+[[agents]]
+name = "custom"
+command = ["sh", "-c", "echo {prompt} for {task}"]
+
+[[providers]]
+name = "ollama"
+upstream = "http://127.0.0.1:11434/v1"
+"#,
+        )
+        .expect("parse matrix");
+
+        assert_eq!(matrix.repeats, 1);
+        assert!(!matrix.allow_dirty);
+        assert_eq!(matrix.providers[0].bind, "127.0.0.1:0");
+        assert!(!matrix.providers[0].record_bodies);
+
+        let command = bench_command(&matrix.agents[0].command, &matrix.tasks[0]);
+        assert_eq!(command[2], "echo say ok for smoke");
+    }
+
+    #[test]
+    fn bench_matrix_rejects_incomplete_definitions() {
+        let missing_agents = parse_bench_matrix(
+            r#"
+[[tasks]]
+name = "smoke"
+"#,
+        );
+        assert!(matches!(missing_agents, Err(Error::Config(_))));
+
+        let empty_command = parse_bench_matrix(
+            r#"
+[[tasks]]
+name = "smoke"
+
+[[agents]]
+name = "custom"
+command = []
+"#,
+        );
+        assert!(matches!(empty_command, Err(Error::Config(_))));
     }
 
     #[test]
