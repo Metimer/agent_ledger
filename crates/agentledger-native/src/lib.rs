@@ -326,8 +326,10 @@ enum Commands {
     },
     Eval {
         run_id: String,
-        #[arg(long = "test")]
+        #[arg(long = "test", required = true)]
         tests: Vec<String>,
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
     },
     Dashboard {
         #[arg(long, default_value = "127.0.0.1:0")]
@@ -440,6 +442,20 @@ fn bench_matrix(
 }
 
 #[pyfunction]
+fn eval_run(
+    py: Python<'_>,
+    run_id: String,
+    tests: Vec<String>,
+    root: Option<String>,
+) -> PyResult<String> {
+    let root = root.unwrap_or_else(|| ".".to_string());
+    let record = py
+        .detach(move || run_post_eval(&run_id, &tests, Path::new(&root)))
+        .map_err(to_py_err)?;
+    serde_json::to_string_pretty(&record).map_err(|err| to_py_err(Error::Json(err)))
+}
+
+#[pyfunction]
 fn compare_runs(task: Option<String>, root: Option<String>) -> PyResult<String> {
     let root = root.unwrap_or_else(|| ".".to_string());
     let report = compare(task, Path::new(&root)).map_err(to_py_err)?;
@@ -517,6 +533,7 @@ fn _native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(init_project, m)?)?;
     m.add_function(wrap_pyfunction!(run_task, m)?)?;
     m.add_function(wrap_pyfunction!(bench_matrix, m)?)?;
+    m.add_function(wrap_pyfunction!(eval_run, m)?)?;
     m.add_function(wrap_pyfunction!(compare_runs, m)?)?;
     m.add_function(wrap_pyfunction!(export_ledger, m)?)?;
     m.add_function(wrap_pyfunction!(doctor, m)?)?;
@@ -576,10 +593,13 @@ fn dispatch(cli: Cli) -> Result<()> {
                 "replay mode '{mode}' for run '{run_id}' is planned after proxy capture"
             )));
         }
-        Commands::Eval { run_id, tests } => {
-            return Err(Error::Unsupported(format!(
-                "post-hoc eval for run '{run_id}' is planned; pass --eval to run for now ({tests:?})"
-            )));
+        Commands::Eval {
+            run_id,
+            tests,
+            root,
+        } => {
+            let record = run_post_eval(&run_id, &tests, &root)?;
+            println!("{}", serde_json::to_string_pretty(&record)?);
         }
         Commands::Dashboard { bind, root } => {
             serve_dashboard(&bind, &root)?;
@@ -1141,16 +1161,59 @@ fn load_runs(root: &Path) -> Result<Vec<RunRecord>> {
     }
     let file = File::open(events_path)?;
     let reader = BufReader::new(file);
-    let mut runs = Vec::new();
+    // The ledger is append-only: a re-evaluated run is appended as a new
+    // event with the same id, and the latest event wins here.
+    let mut order = Vec::new();
+    let mut by_id = BTreeMap::<String, RunRecord>::new();
     for line in reader.lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
         let event: LedgerEvent = serde_json::from_str(&line)?;
-        runs.push(event.run);
+        if !by_id.contains_key(&event.run.id) {
+            order.push(event.run.id.clone());
+        }
+        by_id.insert(event.run.id.clone(), event.run);
     }
-    Ok(runs)
+    Ok(order
+        .into_iter()
+        .filter_map(|id| by_id.remove(&id))
+        .collect())
+}
+
+fn run_post_eval(run_id: &str, tests: &[String], root: &Path) -> Result<RunRecord> {
+    if tests.is_empty() {
+        return Err(Error::Config(
+            "pass at least one --test command".to_string(),
+        ));
+    }
+    let mut run = load_runs(root)?
+        .into_iter()
+        .find(|run| run.id == run_id)
+        .ok_or_else(|| Error::Storage(format!("run '{run_id}' not found in ledger")))?;
+    let repo = PathBuf::from(&run.repo);
+    if !repo.is_dir() {
+        return Err(Error::Capture(format!(
+            "recorded repo path '{}' no longer exists",
+            run.repo
+        )));
+    }
+
+    for test in tests {
+        run.evals.push(run_eval(test, &repo)?);
+    }
+    let command_passed = run.exit_code == Some(0);
+    let evals_passed = run.evals.iter().all(|eval| eval.status == "passed");
+    run.status = if command_passed && evals_passed {
+        "passed"
+    } else {
+        "failed"
+    }
+    .to_string();
+
+    append_run_event(&root.join(".agentledger"), &run)?;
+    Ok(run)
 }
 
 #[derive(Debug, Default)]
@@ -1612,7 +1675,9 @@ mod tests {
     fn ledger_artifacts_are_ignored_in_git_status() {
         assert!(is_ledger_artifact_status("?? AgentLedger.toml"));
         assert!(is_ledger_artifact_status("?? .agentledger/"));
-        assert!(is_ledger_artifact_status(" M .agentledger/runs/x/stdout.txt"));
+        assert!(is_ledger_artifact_status(
+            " M .agentledger/runs/x/stdout.txt"
+        ));
         assert!(!is_ledger_artifact_status(" M src/main.rs"));
     }
 
@@ -1693,6 +1758,67 @@ mod tests {
         assert_eq!(aggregate.metrics.cost_usd, Some(0.003));
         assert_eq!(aggregate.metrics.ttft_ms, Some(120));
         assert_eq!(aggregate.metrics.output_tokens_per_second, Some(4.0));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn sample_run(id: &str, repo: &Path) -> RunRecord {
+        RunRecord {
+            id: id.to_string(),
+            task: "t".to_string(),
+            agent: "a".to_string(),
+            command: vec!["true".to_string()],
+            repo: repo.to_string_lossy().to_string(),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            ended_at: "2026-01-01T00:00:01Z".to_string(),
+            duration_ms: 1000,
+            exit_code: Some(0),
+            status: "passed".to_string(),
+            source_precision: "observed".to_string(),
+            stdout_path: String::new(),
+            stderr_path: String::new(),
+            stdout_preview: String::new(),
+            stderr_preview: String::new(),
+            git: GitSnapshot {
+                is_git_repo: false,
+                base_commit: None,
+                dirty_before: false,
+                dirty_after: false,
+                diffstat: None,
+            },
+            evals: vec![],
+            metrics: RunMetrics::default(),
+        }
+    }
+
+    #[test]
+    fn post_hoc_eval_appends_event_and_recomputes_status() {
+        let root = temp_root();
+        let ledger_dir = root.join(".agentledger");
+        append_run_event(&ledger_dir, &sample_run("run-1", &root)).expect("append run");
+
+        let updated = run_post_eval("run-1", &["exit 0".to_string()], &root).expect("passing eval");
+        assert_eq!(updated.evals.len(), 1);
+        assert_eq!(updated.status, "passed");
+
+        let failed = run_post_eval("run-1", &["exit 1".to_string()], &root).expect("failing eval");
+        assert_eq!(failed.evals.len(), 2);
+        assert_eq!(failed.status, "failed");
+
+        // Three events in the file, but the latest version of the run wins.
+        let runs = load_runs(&root).expect("load runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].evals.len(), 2);
+        assert_eq!(runs[0].status, "failed");
+
+        assert!(matches!(
+            run_post_eval("missing", &["exit 0".to_string()], &root),
+            Err(Error::Storage(_))
+        ));
+        assert!(matches!(
+            run_post_eval("run-1", &[], &root),
+            Err(Error::Config(_))
+        ));
 
         let _ = fs::remove_dir_all(&root);
     }

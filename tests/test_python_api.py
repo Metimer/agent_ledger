@@ -176,6 +176,42 @@ upstream = "http://127.0.0.1:9/v1"
     assert all("http://127.0.0.1" in stdout for stdout in greet_outputs)  # proxy URL injected
 
 
+def test_post_hoc_eval_updates_existing_run(tmp_path: Path) -> None:
+    init_git_repo(tmp_path)
+    agentledger.init(tmp_path)
+
+    result = agentledger.run(
+        task="smoke",
+        agent="custom",
+        command=[sys.executable, "-c", "print('ok')"],
+        repo=tmp_path,
+    )
+    assert result.data["evals"] == []
+
+    updated = agentledger.eval(
+        run_id=result.id,
+        tests=["test -f README.md"],
+        root=tmp_path,
+    )
+    assert updated.id == result.id
+    assert updated.status == "passed"
+    assert len(updated.data["evals"]) == 1
+
+    report = agentledger.compare(task="smoke", root=tmp_path)
+    assert report.run_count == 1  # re-eval must not duplicate the run
+    assert report.data["runs"][0]["eval_status"] == "passed"
+
+    failed = agentledger.eval(
+        run_id=result.id,
+        tests=["test -f missing-file.txt"],
+        root=tmp_path,
+    )
+    assert failed.status == "failed"
+    report = agentledger.compare(task="smoke", root=tmp_path)
+    assert report.run_count == 1
+    assert report.data["runs"][0]["eval_status"] == "failed"
+
+
 def test_doctor(tmp_path: Path) -> None:
     text = agentledger.doctor(tmp_path)
     assert "AgentLedger" in text

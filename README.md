@@ -22,9 +22,10 @@ Current MVP capabilities:
 - run a loopback OpenAI-compatible proxy that records LLM call metrics in `.agentledger/llm_calls.ndjson`;
 - launch the proxy automatically inside `agentledger run` and attach calls to the captured run;
 - stream Server-Sent Events responses through the proxy while recording TTFT and output tokens/s;
-- run benchmark matrices (tasks × agents × providers × repeats) from a TOML file.
+- run benchmark matrices (tasks × agents × providers × repeats) from a TOML file;
+- re-evaluate an existing run post-hoc with `agentledger eval <run-id> --test <cmd>`.
 
-Planned next layers are proxy replay, post-hoc evals, Parquet/DuckDB analytics and OTLP export.
+Planned next layers are proxy replay, Parquet/DuckDB analytics and OTLP export.
 
 ## Quickstart
 
@@ -33,6 +34,7 @@ agentledger init
 agentledger run --task smoke --agent custom --allow-dirty -- echo ok
 agentledger run --task provider-smoke --proxy-upstream http://127.0.0.1:11434/v1 -- python my_agent.py
 agentledger bench --matrix bench.toml
+agentledger eval <run-id> --test "pytest -q"
 agentledger compare smoke
 agentledger export --format csv
 agentledger proxy --upstream http://127.0.0.1:11434/v1
@@ -72,6 +74,10 @@ upstream = "http://127.0.0.1:11434/v1"
 ```
 
 Python: `al.bench(matrix="bench.toml", repo=".", task=None)` returns a `BenchReport` with `cell_count`, `passed`, `failed` and per-cell run ids; runs land in the same ledger, so `al.compare(task=...)` aggregates them.
+
+## Post-hoc evals
+
+`agentledger eval <run-id> --test "pytest -q" [--root .]` (or `al.eval(run_id=..., tests=[...], root=...)`) re-runs eval commands against the repo recorded for an existing run, appends the results to its eval list and recomputes its status. The ledger stays append-only: the updated run is appended as a new hash-chained event with the same id, and readers keep the latest version.
 
 Python:
 

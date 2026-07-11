@@ -360,9 +360,7 @@ fn stream_openai_response(
                 }
                 Err(err) => {
                     if client_connected {
-                        let _ = tx
-                            .send(Err(std::io::Error::other(err.to_string())))
-                            .await;
+                        let _ = tx.send(Err(std::io::Error::other(err.to_string()))).await;
                     }
                     break;
                 }
@@ -427,10 +425,7 @@ impl SseCollector {
     fn observe(&mut self, chunk: &[u8]) {
         self.line_buffer.extend_from_slice(chunk);
         while let Some(newline) = self.line_buffer.iter().position(|&byte| byte == b'\n') {
-            let line = self
-                .line_buffer
-                .drain(..=newline)
-                .collect::<Vec<_>>();
+            let line = self.line_buffer.drain(..=newline).collect::<Vec<_>>();
             let line = String::from_utf8_lossy(&line);
             self.observe_line(&line);
         }
@@ -559,10 +554,7 @@ impl SseCollector {
             duration_ms,
             source_precision,
             request_stream,
-            request_body: self
-                .record_bodies
-                .then(|| request_json.cloned())
-                .flatten(),
+            request_body: self.record_bodies.then(|| request_json.cloned()).flatten(),
             response_body,
             metrics,
         }
@@ -610,7 +602,10 @@ fn responses_delta_text(event: &Value) -> Option<String> {
     if !event_type.ends_with(".delta") {
         return None;
     }
-    event.get("delta").and_then(Value::as_str).map(str::to_string)
+    event
+        .get("delta")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn upstream_url(upstream_base: &str, endpoint: &str) -> String {
@@ -980,9 +975,7 @@ mod tests {
         );
         let upstream_app = Router::new().route(
             "/v1/chat/completions",
-            post(move || async move {
-                ([(header::CONTENT_TYPE, "text/event-stream")], sse_body)
-            }),
+            post(move || async move { ([(header::CONTENT_TYPE, "text/event-stream")], sse_body) }),
         );
         let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1028,7 +1021,8 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(!line.trim().is_empty(), "llm call record was not written");
-        let record: Value = serde_json::from_str(line.lines().next().unwrap()).expect("record json");
+        let record: Value =
+            serde_json::from_str(line.lines().next().unwrap()).expect("record json");
         assert_eq!(
             record.get("run_id").and_then(Value::as_str),
             Some("run-stream")
@@ -1038,10 +1032,15 @@ mod tests {
             Some("exact")
         );
         assert_eq!(
-            record.pointer("/metrics/total_tokens").and_then(Value::as_u64),
+            record
+                .pointer("/metrics/total_tokens")
+                .and_then(Value::as_u64),
             Some(16)
         );
-        assert!(record.pointer("/metrics/ttft_ms").and_then(Value::as_u64).is_some());
+        assert!(record
+            .pointer("/metrics/ttft_ms")
+            .and_then(Value::as_u64)
+            .is_some());
 
         drop(proxy);
         let _ = fs::remove_dir_all(&root);

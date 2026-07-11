@@ -142,6 +142,9 @@ class AgentLedger:
     def bench(self, *, matrix: str | Path, task: str | None = None) -> BenchReport:
         return bench(matrix=matrix, repo=self.root, task=task)
 
+    def eval(self, *, run_id: str, tests: Iterable[str]) -> RunResult:
+        return eval(run_id=run_id, tests=tests, root=self.root)
+
     def compare(self, task: str | None = None) -> CompareReport:
         return compare(task=task, root=self.root)
 
@@ -208,8 +211,14 @@ def replay(*args: Any, **kwargs: Any) -> None:
     raise NotImplementedError("replay will land after proxy capture")
 
 
-def eval(*args: Any, **kwargs: Any) -> None:  # noqa: A001
-    raise NotImplementedError("post-hoc eval will land after run-time eval commands")
+def eval(  # noqa: A001
+    *,
+    run_id: str,
+    tests: Iterable[str],
+    root: str | Path = ".",
+) -> RunResult:
+    payload = _native.eval_run(run_id, [str(test) for test in tests], str(root))
+    return RunResult(json.loads(payload))
 
 
 def export(
