@@ -114,13 +114,13 @@ Puis le run proxifié :
 
 ```bash
 agentledger run --task llm-smoke --allow-dirty --proxy-upstream http://127.0.0.1:4141/v1 -- \
-  sh -c 'curl -sS -X POST "$OPENAI_BASE_URL/chat/completions" -H "content-type: application/json" -d "{\"model\":\"mock\",\"messages\":[]}"'
+  sh -c 'curl -sS -X POST "$OPENAI_BASE_URL/chat/completions" -H "content-type: application/json" -d "{\"model\":\"mock\",\"messages\":[{\"role\":\"user\",\"content\":\"Dis bonjour\"}]}"'
 ```
 
 **Attendu** :
 - Une ligne `AgentLedger OpenAI-compatible proxy: http://127.0.0.1:<port>/v1` (port éphémère).
 - `stdout_preview` du run contient la réponse JSON du mock (`"Bonjour"`).
-- `.agentledger/llm_calls.ndjson` contient 1 enregistrement : `"run_id"` = id du run, `"model": "mock"`, `"status": 200`, `"source_precision": "exact"`, `metrics.input_tokens: 11`, `output_tokens: 5`, `total_tokens: 16`, `cost_usd: null`, `ttft_ms: null` (pas de streaming ici).
+- `.agentledger/llm_calls.ndjson` contient 1 enregistrement : `"run_id"` = id du run, `"model": "mock"`, `"prompt": "Dis bonjour"` (capture activée par défaut ; `privacy.capture_prompts = false` dans `AgentLedger.toml` la coupe), `"status": 200`, `"source_precision": "exact"`, `metrics.input_tokens: 11`, `output_tokens: 5`, `total_tokens: 16`, `cost_usd: null`, `ttft_ms: null` (pas de streaming ici).
 
 ## 7. Streaming SSE à travers le proxy
 
@@ -128,12 +128,12 @@ agentledger run --task llm-smoke --allow-dirty --proxy-upstream http://127.0.0.1
 
 ```bash
 agentledger run --task llm-stream --allow-dirty --proxy-upstream http://127.0.0.1:4141/v1 -- \
-  sh -c 'curl -sS -N -X POST "$OPENAI_BASE_URL/chat/completions" -H "content-type: application/json" -d "{\"model\":\"mock\",\"stream\":true,\"messages\":[]}"'
+  sh -c 'curl -sS -N -X POST "$OPENAI_BASE_URL/chat/completions" -H "content-type: application/json" -d "{\"model\":\"mock\",\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"Dis bonjour\"}]}"'
 ```
 
 **Attendu** :
 - `stdout_preview` contient les événements SSE bruts : `data: {"model":"mock",...`Bon`...`, `data: [DONE]` (relayés chunk par chunk, pas bufferisés).
-- Dernière ligne de `.agentledger/llm_calls.ndjson` : `"request_stream": true`, `"source_precision": "exact"`, `metrics.total_tokens: 16`, **`ttft_ms` renseigné** (entier ≥ 0), `output_tokens_per_second` renseigné.
+- Dernière ligne de `.agentledger/llm_calls.ndjson` : `"request_stream": true`, `"prompt": "Dis bonjour"`, `"source_precision": "exact"`, `metrics.total_tokens: 16`, **`ttft_ms` renseigné** (entier ≥ 0), `output_tokens_per_second` renseigné.
 
 Arrêter le mock : `kill %1`.
 
@@ -262,13 +262,16 @@ agentledger dashboard &
 - `db sync` → JSON avec `runs_upserted`/`llm_calls_upserted` et le chemin `.agentledger/ledger.db` ; un second `db sync` → compteurs à 0 (incrémental).
 - `db query` → une ligne JSON par résultat ; une requête d'écriture (`INSERT ...`) → erreur « readonly ».
 - Dashboard : ligne `AgentLedger dashboard: http://127.0.0.1:<port>/?token=<uuid>`.
-- Ouvrir l'URL avec token et vérifier les **4 vues** :
+- Ouvrir l'URL avec token et vérifier les **5 vues** :
   1. **Runs** — tableau filtrable (tâche/agent/statut) et triable, colonnes durée/TTFT/tokens/coût/éval/erreurs LLM ; clic sur une ligne → détail.
   2. **Tâches** — sélectionner une tâche de bench : barres comparatives par agent (durée, TTFT, tokens, coût, tok/s) + « n/m passed » ; les agents gardent la même couleur partout.
-  3. **Détail** — méta du run, git, évals, appels LLM (statut HTTP en rouge si ≥ 400, corps dépliables si `record_bodies`), boutons stdout/stderr.
-  4. **Tendances** — courbes par jour (runs, coût, tokens, durée moyenne), filtrables par tâche.
+  3. **Modèles** — comparaison providers/modèles agrégée sur les appels LLM : tableau + barres (TTFT, durée/appel, tokens, coût, tok/s) ; filtrer par tâche puis sélectionner un prompt dans la liste → le prompt comparé s'affiche en clair et les métriques se recalculent **à prompt égal**.
+  4. **Détail** — méta du run, git, évals, appels LLM (prompt envoyé affiché sous chaque appel, statut HTTP en rouge si ≥ 400, corps dépliables si `record_bodies`), boutons stdout/stderr.
+  5. **Tendances** — courbes par jour (runs, coût, tokens, durée moyenne), filtrables par tâche.
 - `curl http://127.0.0.1:<port>/api/runs` **sans** token → `401`.
 - `curl "http://127.0.0.1:<port>/api/tasks?token=<uuid>"` → agrégats JSON par tâche×agent.
+- `curl "http://127.0.0.1:<port>/api/models?token=<uuid>"` → agrégats JSON par modèle×provider (`calls`, `avg_ttft_ms`, `token_output`, `cost_usd`, ...).
+- `curl "http://127.0.0.1:<port>/api/prompts?token=<uuid>"` → liste des prompts capturés distincts avec leur nombre d'appels.
 - `kill %1` pour arrêter.
 
 ## 12. API Python

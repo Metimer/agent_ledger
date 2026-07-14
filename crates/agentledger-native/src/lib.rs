@@ -152,7 +152,7 @@ impl Default for AgentLedgerConfig {
                 root: ".agentledger".to_string(),
             },
             privacy: PrivacyConfig {
-                capture_prompts: false,
+                capture_prompts: true,
                 capture_diffs: true,
                 redact_env: vec![
                     "API_KEY".to_string(),

@@ -18,7 +18,7 @@ Current MVP capabilities:
 - compare runs by task;
 - export the ledger as JSONL or CSV;
 - index every run and LLM call into an embedded SQLite database for SQL queries;
-- open a token-protected local dashboard on `127.0.0.1` with filterable runs, per-task agent comparison charts, run details and daily trends;
+- open a token-protected local dashboard on `127.0.0.1` with filterable runs, per-task agent comparison charts, per-prompt provider/model comparison charts, run details and daily trends;
 - use a Python API around the same native core;
 - run a loopback OpenAI-compatible proxy that records LLM call metrics in `.agentledger/llm_calls.ndjson`;
 - launch the proxy automatically inside `agentledger run` and attach calls to the captured run;
@@ -90,7 +90,9 @@ agentledger db query "SELECT task, agent, count(*) runs, avg(duration_ms) avg_ms
 
 Python: `al.sync_db(root=".")` and `al.query("SELECT ...", root=".")` (rows as dicts, resynced automatically).
 
-`agentledger dashboard` serves a token-protected local UI on loopback backed by the same index: a filterable/sortable runs table, per-task agent comparison charts (duration, TTFT, tokens, cost, tokens/s), a run detail view (evals, LLM calls with metrics and recorded bodies, stdout/stderr) and daily trend charts. JSON endpoints (`/api/runs`, `/api/runs/{id}`, `/api/runs/{id}/output`, `/api/tasks`, `/api/timeseries`) are available with the same token for scripting.
+`agentledger dashboard` serves a token-protected local UI on loopback backed by the same index: a filterable/sortable runs table, per-task agent comparison charts (duration, TTFT, tokens, cost, tokens/s), a provider/model comparison view that groups LLM calls by model and upstream — filterable by task and by exact prompt, with the compared prompt displayed in full — a run detail view (evals, LLM calls with the captured prompt, metrics and recorded bodies, stdout/stderr) and daily trend charts. JSON endpoints (`/api/runs`, `/api/runs/{id}`, `/api/runs/{id}/output`, `/api/tasks`, `/api/models`, `/api/prompts`, `/api/timeseries`) are available with the same token for scripting.
+
+The proxy captures the user prompt of each call (truncated to 2000 chars) so the dashboard can compare providers and models at equal prompt. Set `privacy.capture_prompts = false` in `AgentLedger.toml` to opt out; recorded bodies (`record_bodies`) always imply prompt capture.
 
 ## Post-hoc evals
 

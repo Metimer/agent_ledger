@@ -7,7 +7,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-const DB_SCHEMA_VERSION: i32 = 1;
+const DB_SCHEMA_VERSION: i32 = 2;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS runs (
@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS llm_calls (
   timestamp TEXT,
   endpoint TEXT,
   model TEXT,
+  prompt TEXT,
   status INTEGER,
   duration_ms INTEGER,
   source_precision TEXT,
@@ -73,6 +74,7 @@ CREATE TABLE IF NOT EXISTS llm_calls (
   response_body TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_llm_calls_run ON llm_calls(run_id);
+CREATE INDEX IF NOT EXISTS idx_llm_calls_model ON llm_calls(model);
 
 CREATE TABLE IF NOT EXISTS sync_state (
   file TEXT PRIMARY KEY,
@@ -106,6 +108,17 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|err| err.to_string())?;
     if version < DB_SCHEMA_VERSION {
+        if version > 0 {
+            // The NDJSON ledger is the source of truth: on a schema bump we
+            // drop everything and let the next sync rebuild from scratch.
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS runs;
+                 DROP TABLE IF EXISTS evals;
+                 DROP TABLE IF EXISTS llm_calls;
+                 DROP TABLE IF EXISTS sync_state;",
+            )
+            .map_err(|err| err.to_string())?;
+        }
         conn.execute_batch(SCHEMA_SQL)
             .map_err(|err| err.to_string())?;
         conn.pragma_update(None, "user_version", DB_SCHEMA_VERSION)
@@ -309,13 +322,20 @@ fn upsert_llm_call(conn: &Connection, call: &Value, fallback_id: &str) -> Result
             .filter(|value| !value.is_null())
             .map(|value| value.to_string())
     };
+    // Older records carry no prompt field; fall back to extracting it from
+    // the recorded request body when bodies were captured.
+    let prompt = call
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| crate::proxy::extract_prompt(call.get("request_body")));
     conn.execute(
         "INSERT OR REPLACE INTO llm_calls (
-            id, run_id, timestamp, endpoint, model, status, duration_ms,
+            id, run_id, timestamp, endpoint, model, prompt, status, duration_ms,
             source_precision, request_stream, input_tokens, output_tokens,
             total_tokens, cached_tokens, reasoning_tokens, cost_usd, ttft_ms,
             output_tokens_per_second, upstream_base, request_body, response_body
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
         params![
             call.get("id")
                 .and_then(Value::as_str)
@@ -324,6 +344,7 @@ fn upsert_llm_call(conn: &Connection, call: &Value, fallback_id: &str) -> Result
             call.get("timestamp").and_then(Value::as_str),
             call.get("endpoint").and_then(Value::as_str),
             call.get("model").and_then(Value::as_str),
+            prompt,
             call.get("status").and_then(Value::as_u64).map(|v| v as i64),
             call.get("duration_ms")
                 .and_then(Value::as_u64)
@@ -454,7 +475,7 @@ pub fn run_detail(root: &Path, run_id: &str) -> Result<Option<Value>, String> {
 
     let mut calls_stmt = conn
         .prepare(
-            "SELECT id, timestamp, endpoint, model, status, duration_ms, source_precision,
+            "SELECT id, timestamp, endpoint, model, prompt, status, duration_ms, source_precision,
                     request_stream, input_tokens, output_tokens, total_tokens, cached_tokens,
                     reasoning_tokens, cost_usd, ttft_ms, output_tokens_per_second,
                     upstream_base, request_body, response_body
@@ -514,6 +535,62 @@ pub fn task_aggregates(root: &Path) -> Result<Vec<Value>, String> {
         )
         .map_err(|err| err.to_string())?;
     rows_to_json(&mut stmt, [])
+}
+
+/// Metrics grouped by model × provider (upstream), the provider/model
+/// comparison behind the dashboard "Modèles" view. Optional filters restrict
+/// to one task and/or one exact prompt.
+pub fn model_aggregates(
+    root: &Path,
+    task: Option<&str>,
+    prompt: Option<&str>,
+) -> Result<Vec<Value>, String> {
+    let conn = open_rw(root)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT COALESCE(c.model, 'inconnu') AS model,
+                    COALESCE(c.upstream_base, '–') AS provider,
+                    COUNT(*) AS calls,
+                    COUNT(DISTINCT c.run_id) AS runs,
+                    SUM(CASE WHEN c.status >= 400 THEN 1 ELSE 0 END) AS error_calls,
+                    AVG(c.ttft_ms) AS avg_ttft_ms,
+                    AVG(c.duration_ms) AS avg_duration_ms,
+                    SUM(c.input_tokens) AS token_input,
+                    SUM(c.output_tokens) AS token_output,
+                    SUM(c.reasoning_tokens) AS reasoning_tokens,
+                    SUM(c.cost_usd) AS cost_usd,
+                    AVG(c.output_tokens_per_second) AS avg_output_tokens_per_second,
+                    MAX(c.timestamp) AS last_call_at
+             FROM llm_calls c
+             LEFT JOIN runs r ON r.id = c.run_id
+             WHERE (?1 IS NULL OR r.task = ?1)
+               AND (?2 IS NULL OR c.prompt = ?2)
+             GROUP BY c.model, c.upstream_base
+             ORDER BY model, provider",
+        )
+        .map_err(|err| err.to_string())?;
+    rows_to_json(&mut stmt, params![task, prompt])
+}
+
+/// Distinct captured prompts (newest first), to populate the prompt filter.
+pub fn prompt_options(root: &Path, task: Option<&str>) -> Result<Vec<Value>, String> {
+    let conn = open_rw(root)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT c.prompt,
+                    COUNT(*) AS calls,
+                    COUNT(DISTINCT c.model) AS models,
+                    MAX(c.timestamp) AS last_call_at
+             FROM llm_calls c
+             LEFT JOIN runs r ON r.id = c.run_id
+             WHERE c.prompt IS NOT NULL
+               AND (?1 IS NULL OR r.task = ?1)
+             GROUP BY c.prompt
+             ORDER BY last_call_at DESC
+             LIMIT 200",
+        )
+        .map_err(|err| err.to_string())?;
+    rows_to_json(&mut stmt, params![task])
 }
 
 pub fn timeseries(root: &Path, task: Option<&str>) -> Result<Vec<Value>, String> {
@@ -582,10 +659,23 @@ mod tests {
     }
 
     fn write_llm_call(root: &Path, run_id: &str, total_tokens: u64, ttft_ms: u64) {
+        write_llm_call_for_model(root, run_id, "mock", None, total_tokens, ttft_ms);
+    }
+
+    fn write_llm_call_for_model(
+        root: &Path,
+        run_id: &str,
+        model: &str,
+        prompt: Option<&str>,
+        total_tokens: u64,
+        ttft_ms: u64,
+    ) {
         let line = json!({
             "id": Uuid::new_v4().to_string(),
             "run_id": run_id,
-            "model": "mock",
+            "model": model,
+            "prompt": prompt,
+            "upstream_base": "https://openrouter.ai/api/v1",
             "status": 200,
             "duration_ms": 1000,
             "metrics": {
@@ -661,6 +751,84 @@ mod tests {
         assert_eq!(rows[0]["status"], json!("failed"));
         assert_eq!(rows[0]["eval_count"], json!(1));
         assert_eq!(rows[0]["eval_status"], json!("failed"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn model_aggregates_group_by_model_and_filter_by_prompt() {
+        let root = temp_root();
+        let ledger_dir = root.join(".agentledger");
+        append_run_event(&ledger_dir, &sample_run("run-1", &root)).expect("append run");
+        write_llm_call_for_model(&root, "run-1", "modele-a", Some("dis bonjour"), 100, 200);
+        write_llm_call_for_model(&root, "run-1", "modele-b", Some("dis bonjour"), 60, 900);
+        write_llm_call_for_model(
+            &root,
+            "run-1",
+            "modele-b",
+            Some("compte jusqu'à 3"),
+            40,
+            400,
+        );
+        sync(&root).expect("sync");
+
+        let all = model_aggregates(&root, None, None).expect("aggregates");
+        assert_eq!(all.len(), 2);
+        let model_b = all
+            .iter()
+            .find(|row| row["model"] == json!("modele-b"))
+            .expect("modele-b row");
+        assert_eq!(model_b["calls"], json!(2));
+        assert_eq!(model_b["token_output"], json!(50));
+        assert_eq!(model_b["error_calls"], json!(0));
+
+        // À prompt égal : un seul appel par modèle.
+        let filtered = model_aggregates(&root, Some("t"), Some("dis bonjour")).expect("filtered");
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().all(|row| row["calls"] == json!(1)));
+        assert_eq!(
+            model_aggregates(&root, Some("autre-tache"), None)
+                .expect("no match")
+                .len(),
+            0
+        );
+
+        let prompts = prompt_options(&root, None).expect("prompts");
+        assert_eq!(prompts.len(), 2);
+        let greeting = prompts
+            .iter()
+            .find(|row| row["prompt"] == json!("dis bonjour"))
+            .expect("greeting prompt");
+        assert_eq!(greeting["calls"], json!(2));
+        assert_eq!(greeting["models"], json!(2));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prompt_falls_back_to_recorded_request_body() {
+        let root = temp_root();
+        let ledger_dir = root.join(".agentledger");
+        append_run_event(&ledger_dir, &sample_run("run-1", &root)).expect("append run");
+        // Enregistrement ancien format : pas de champ prompt, mais un corps.
+        let line = json!({
+            "id": "call-legacy",
+            "run_id": "run-1",
+            "model": "mock",
+            "status": 200,
+            "request_body": { "messages": [{ "role": "user", "content": "prompt du corps" }] },
+            "metrics": {}
+        });
+        let path = root.join(".agentledger").join("llm_calls.ndjson");
+        fs::write(&path, format!("{line}\n")).expect("write llm call");
+        sync(&root).expect("sync");
+
+        let rows = query(
+            &root,
+            "SELECT prompt FROM llm_calls WHERE id = 'call-legacy'",
+        )
+        .expect("query prompt");
+        assert_eq!(rows[0]["prompt"], json!("prompt du corps"));
 
         let _ = fs::remove_dir_all(&root);
     }

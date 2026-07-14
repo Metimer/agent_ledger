@@ -104,6 +104,11 @@ svg .gridline { stroke: var(--grid); stroke-width: 1; }
 }
 button.link { background: none; border: none; color: var(--s1); cursor: pointer; font: inherit; padding: 0; }
 .backlink { margin-bottom: 12px; display: inline-block; }
+.prompt-text {
+  font-size: 13px; white-space: pre-wrap; word-break: break-word;
+  background: var(--page); border-left: 3px solid var(--s1);
+  padding: 8px 12px; border-radius: 4px; max-height: 180px; overflow: auto;
+}
 </style>
 </head>
 <body>
@@ -113,6 +118,7 @@ button.link { background: none; border: none; color: var(--s1); cursor: pointer;
   <nav>
     <button data-view="runs" class="active">Runs</button>
     <button data-view="tasks">Tâches</button>
+    <button data-view="models">Modèles</button>
     <button data-view="detail">Détail</button>
     <button data-view="trends">Tendances</button>
   </nav>
@@ -157,6 +163,15 @@ button.link { background: none; border: none; color: var(--s1); cursor: pointer;
     <div id="task-content"></div>
   </section>
 
+  <section id="view-models">
+    <div class="filters">
+      <select id="m-task"><option value="">Toutes les tâches</option></select>
+      <select id="m-prompt"><option value="">Tous les prompts</option></select>
+      <span class="sub">Comparaison des providers / modèles — filtrez sur un prompt pour comparer à prompt égal</span>
+    </div>
+    <div id="models-content"></div>
+  </section>
+
   <section id="view-detail">
     <div id="detail-content"><div class="empty">Sélectionnez un run dans l'onglet Runs.</div></div>
   </section>
@@ -174,7 +189,7 @@ button.link { background: none; border: none; color: var(--s1); cursor: pointer;
 "use strict";
 const token = new URLSearchParams(location.search).get("token") || "";
 const SERIES = ["--s1","--s2","--s3","--s4","--s5","--s6","--s7","--s8"];
-let runs = [], tasks = [], agentSlots = new Map();
+let runs = [], tasks = [], agentSlots = new Map(), pendingModelPrompt = null;
 let sortKey = "started_at", sortDir = -1;
 
 const $ = (sel) => document.querySelector(sel);
@@ -218,6 +233,10 @@ function bindTips(rootEl) {
 }
 
 /* ---------- graphes SVG ---------- */
+const midEllipsis = (s, max) => s.length > max
+  ? s.slice(0, Math.ceil((max - 1) / 2)) + "…" + s.slice(-Math.floor((max - 1) / 2))
+  : s;
+
 function hbarChart({ items, format }) {
   // items: [{label, value, colorVar, tip}] — barres horizontales fines,
   // extrémité arrondie 4px, labels directs, une seule échelle.
@@ -229,7 +248,7 @@ function hbarChart({ items, format }) {
   items.forEach((item, i) => {
     const y = i * rowH + 6;
     const w = item.value == null ? 0 : Math.max((item.value / max) * plotW, item.value > 0 ? 3 : 0);
-    bars += `<text x="${labelW - 8}" y="${y + 11}" text-anchor="end">${esc(item.label).slice(0, 26)}</text>`;
+    bars += `<text x="${labelW - 8}" y="${y + 11}" text-anchor="end" data-tip="${esc(item.tip || item.label)}">${esc(midEllipsis(item.label, 22))}</text>`;
     if (item.value != null) {
       bars += `<rect x="${labelW}" y="${y}" width="${w}" height="14" rx="4"
         fill="var(${item.colorVar})" data-tip="${esc(item.tip || "")}"></rect>`;
@@ -333,6 +352,86 @@ function renderTasks() {
   bindTips(container);
 }
 
+/* ---------- vue Modèles ---------- */
+const providerShort = (base) => String(base || "")
+  .replace(/^https?:\/\//, "").replace(/\/v1\/?$/, "").replace(/\/$/, "") || "–";
+const promptLabel = (p) => p.length > 70 ? p.slice(0, 70).replace(/\s+/g, " ") + "…" : p.replace(/\s+/g, " ");
+
+async function renderModels() {
+  const task = $("#m-task").value;
+  const container = $("#models-content");
+  let prompts, rows;
+  try {
+    [prompts, rows] = await Promise.all([
+      api("/api/prompts", { task }),
+      api("/api/models", { task, prompt: $("#m-prompt").value }),
+    ]);
+  } catch (err) { container.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
+
+  // Le select prompt suit la tâche filtrée ; la sélection est conservée si possible.
+  const select = $("#m-prompt");
+  const current = select.value;
+  select.innerHTML = `<option value="">Tous les prompts</option>` + prompts.map((p) =>
+    `<option value="${esc(p.prompt)}">${esc(promptLabel(p.prompt))} (${p.calls} appels)</option>`).join("");
+  const wanted = pendingModelPrompt ?? current;
+  pendingModelPrompt = null;
+  select.value = prompts.some((p) => p.prompt === wanted) ? wanted : "";
+  const prompt = select.value;
+  // Les données ont été chargées avec l'ancien filtre : re-fetch unique si besoin.
+  if (prompt !== current) return renderModels();
+
+  if (!rows.length) {
+    container.innerHTML = `<div class="empty">Aucun appel LLM capturé${task || prompt ? " pour ce filtre" : ""} —
+      les métriques par modèle viennent des runs passés par le proxy (<code>--proxy-upstream …</code>).</div>`;
+    return;
+  }
+
+  const multiProvider = new Set(rows.map((r) => r.provider)).size > 1;
+  const label = (r) => multiProvider ? `${r.model} · ${providerShort(r.provider)}` : r.model;
+  const slots = new Map();
+  rows.forEach((r) => { if (!slots.has(label(r))) slots.set(label(r), slots.size); });
+  const colorOf = (r) => SERIES[slots.get(label(r)) % SERIES.length];
+
+  const promptCard = prompt ? `<div class="card"><h3>Prompt comparé</h3>
+    <div class="prompt-text">${esc(prompt)}</div></div>` : "";
+  const legend = `<div class="legend">${rows.map((r) =>
+    `<span><i style="background:var(${colorOf(r)})"></i>${esc(label(r))} — ${r.calls} appel(s)${r.error_calls ? `, <b style="color:var(--critical)">${r.error_calls} erreur(s)</b>` : ""}</span>`).join("")}</div>`;
+
+  const metric = (title, hint, key, format, invertHint) => {
+    const items = rows.map((r) => ({
+      label: label(r), value: r[key], colorVar: colorOf(r),
+      tip: `<b>${esc(r.model)}</b> — ${esc(providerShort(r.provider))}<br>${title} : ${r[key] == null ? "–" : format(r[key])}<br>${r.calls} appel(s), ${r.runs} run(s)`,
+    }));
+    if (items.every((i) => i.value == null)) return "";
+    return `<div class="card"><h3>${title}</h3><div class="hint">${hint}${invertHint ? " — plus bas = mieux" : ""}</div>${hbarChart({ items, format })}</div>`;
+  };
+
+  const table = `<div class="card" style="padding:0"><table>
+    <thead><tr class="static"><th>Modèle</th><th>Provider</th><th class="num">Appels</th><th class="num">Erreurs</th>
+      <th class="num">TTFT moyen</th><th class="num">Durée/appel</th><th class="num">In</th><th class="num">Out</th>
+      <th class="num">Coût</th><th class="num">tok/s</th></tr></thead>
+    <tbody>${rows.map((r) => `<tr class="static">
+      <td><span style="display:inline-flex;align-items:center;gap:6px">
+        <i style="width:9px;height:9px;border-radius:3px;background:var(${colorOf(r)});display:inline-block"></i>${esc(r.model)}</span></td>
+      <td><code>${esc(providerShort(r.provider))}</code></td>
+      <td class="num">${r.calls}</td>
+      <td class="num" style="${r.error_calls ? "color:var(--critical)" : ""}">${r.error_calls}</td>
+      <td class="num">${fmtMs(r.avg_ttft_ms)}</td><td class="num">${fmtMs(r.avg_duration_ms)}</td>
+      <td class="num">${fmtNum(r.token_input)}</td><td class="num">${fmtNum(r.token_output)}</td>
+      <td class="num">${fmtCost(r.cost_usd)}</td>
+      <td class="num">${r.avg_output_tokens_per_second == null ? "–" : r.avg_output_tokens_per_second.toFixed(1)}</td>
+    </tr>`).join("")}</tbody></table></div>`;
+
+  container.innerHTML = promptCard + legend + table + `<div class="grid2">` +
+    metric("TTFT moyen", "premier token (streaming)", "avg_ttft_ms", fmtMs, true) +
+    metric("Durée moyenne par appel", "aller-retour complet", "avg_duration_ms", fmtMs, true) +
+    metric("Tokens générés", "total sur tous les appels", "token_output", fmtNum, false) +
+    metric("Coût total", "somme usage provider", "cost_usd", fmtCost, true) +
+    metric("Débit moyen", "tokens/s en génération", "avg_output_tokens_per_second", (v) => v.toFixed(1) + " tok/s", false) +
+    `</div>`;
+  bindTips(container);
+}
+
 /* ---------- vue Détail ---------- */
 async function openDetail(id) {
   switchView("detail");
@@ -376,6 +475,8 @@ async function openDetail(id) {
         <td class="num">${fmtNum(c.input_tokens)}</td><td class="num">${fmtNum(c.output_tokens)}</td>
         <td class="num">${c.output_tokens_per_second == null ? "–" : c.output_tokens_per_second.toFixed(1)}</td>
         <td class="num">${fmtCost(c.cost_usd)}</td><td>${esc(c.source_precision || "–")}</td></tr>
+        ${c.prompt ? `<tr class="static"><td colspan="10" style="border-bottom:none;padding-top:0">
+          <div class="hint">prompt envoyé</div><div class="prompt-text">${esc(c.prompt)}</div></td></tr>` : ""}
         ${c.response_body ? `<tr class="static"><td colspan="10"><details><summary class="hint" style="cursor:pointer">corps de réponse enregistré</summary><pre>${esc(prettyBody(c.response_body))}</pre></details></td></tr>` : ""}`).join("")}</tbody></table>`
       : `<div class="hint">Aucun appel LLM lié à ce run.</div>`}
     </div>
@@ -434,6 +535,7 @@ function switchView(view) {
   document.querySelectorAll("main section").forEach((s) => s.classList.toggle("active", s.id === `view-${view}`));
   if (view === "trends") renderTrends();
   if (view === "tasks") renderTasks();
+  if (view === "models") renderModels();
 }
 
 function fillSelect(select, values, keepFirst = true) {
@@ -452,6 +554,7 @@ async function refresh() {
   fillSelect($("#f-task"), taskNames);
   fillSelect($("#f-agent"), agentNames);
   fillSelect($("#tr-task"), taskNames);
+  fillSelect($("#m-task"), taskNames);
   fillSelect($("#t-task"), taskNames, false);
   $("#summary").textContent = `${runs.length} runs · ${taskNames.length} tâches · ${agentNames.length} agents`;
   renderRuns();
@@ -464,6 +567,8 @@ document.querySelectorAll("nav button").forEach((b) =>
   $(sel).addEventListener("change", renderRuns));
 $("#t-task").addEventListener("change", renderTasks);
 $("#tr-task").addEventListener("change", renderTrends);
+$("#m-task").addEventListener("change", renderModels);
+$("#m-prompt").addEventListener("change", renderModels);
 document.querySelectorAll("#runs-table th").forEach((th) =>
   th.addEventListener("click", () => {
     const k = th.dataset.k;
@@ -474,7 +579,8 @@ document.querySelectorAll("#runs-table th").forEach((th) =>
 refresh().then(() => {
   const [view, arg] = location.hash.slice(1).split("=");
   if (view === "tasks" && arg) { $("#t-task").value = decodeURIComponent(arg); renderTasks(); }
-  if (["runs", "tasks", "detail", "trends"].includes(view)) switchView(view);
+  if (view === "models" && arg) pendingModelPrompt = decodeURIComponent(arg);
+  if (["runs", "tasks", "models", "detail", "trends"].includes(view)) switchView(view);
 }).catch((err) => {
   document.body.insertAdjacentHTML("beforeend",
     `<div class="empty">Erreur de chargement : ${esc(err.message)} — vérifiez le token dans l'URL.</div>`);

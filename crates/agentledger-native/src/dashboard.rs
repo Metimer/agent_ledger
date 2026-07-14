@@ -45,6 +45,8 @@ fn build_router(root: PathBuf, token: String) -> Router {
         .route("/api/runs/{id}", get(api_run_detail))
         .route("/api/runs/{id}/output", get(api_run_output))
         .route("/api/tasks", get(api_tasks))
+        .route("/api/models", get(api_models))
+        .route("/api/prompts", get(api_prompts))
         .route("/api/timeseries", get(api_timeseries))
         .with_state(state)
 }
@@ -182,6 +184,44 @@ async fn api_tasks(
     }
 }
 
+async fn api_models(
+    State(state): State<Arc<DashboardState>>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if !authorized(&state, &headers, &params) {
+        return unauthorized();
+    }
+    if let Err(err) = db::sync(&state.root) {
+        return storage_error(err);
+    }
+    match db::model_aggregates(
+        &state.root,
+        filter_param(&params, "task"),
+        filter_param(&params, "prompt"),
+    ) {
+        Ok(rows) => Json(rows).into_response(),
+        Err(err) => storage_error(err),
+    }
+}
+
+async fn api_prompts(
+    State(state): State<Arc<DashboardState>>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if !authorized(&state, &headers, &params) {
+        return unauthorized();
+    }
+    if let Err(err) = db::sync(&state.root) {
+        return storage_error(err);
+    }
+    match db::prompt_options(&state.root, filter_param(&params, "task")) {
+        Ok(rows) => Json(rows).into_response(),
+        Err(err) => storage_error(err),
+    }
+}
+
 async fn api_timeseries(
     State(state): State<Arc<DashboardState>>,
     headers: HeaderMap,
@@ -237,6 +277,18 @@ mod tests {
             llm_error_calls: 0,
         };
         append_run_event(&ledger_dir, &run).expect("append run");
+        let call = json!({
+            "id": "call-1",
+            "run_id": "run-dash",
+            "model": "mock-model",
+            "prompt": "dis bonjour",
+            "upstream_base": "http://127.0.0.1:4141/v1",
+            "status": 200,
+            "duration_ms": 100,
+            "metrics": { "input_tokens": 3, "output_tokens": 5, "total_tokens": 8 }
+        });
+        fs::write(ledger_dir.join("llm_calls.ndjson"), format!("{call}\n"))
+            .expect("write llm call");
         root
     }
 
@@ -302,6 +354,47 @@ mod tests {
             .expect("json");
         assert_eq!(aggregates[0]["task"], json!("smoke"));
         assert_eq!(aggregates[0]["runs"], json!(1));
+
+        let models: Value = client
+            .get(format!("{base}/api/models?token={token}"))
+            .send()
+            .await
+            .expect("models")
+            .json()
+            .await
+            .expect("json");
+        assert_eq!(models[0]["model"], json!("mock-model"));
+        assert_eq!(models[0]["calls"], json!(1));
+        assert_eq!(models[0]["token_output"], json!(5));
+
+        let filtered_models: Value = client
+            .get(format!(
+                "{base}/api/models?token={token}&prompt=autre+prompt"
+            ))
+            .send()
+            .await
+            .expect("filtered models")
+            .json()
+            .await
+            .expect("json");
+        assert_eq!(filtered_models.as_array().map(Vec::len), Some(0));
+
+        let prompts: Value = client
+            .get(format!("{base}/api/prompts?token={token}"))
+            .send()
+            .await
+            .expect("prompts")
+            .json()
+            .await
+            .expect("json");
+        assert_eq!(prompts[0]["prompt"], json!("dis bonjour"));
+
+        let prompts_unauthorized = client
+            .get(format!("{base}/api/prompts"))
+            .send()
+            .await
+            .expect("prompts unauthorized");
+        assert_eq!(prompts_unauthorized.status().as_u16(), 401);
 
         let detail: Value = client
             .get(format!("{base}/api/runs/run-dash?token={token}"))

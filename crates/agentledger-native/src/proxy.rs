@@ -27,6 +27,7 @@ struct ProxyState {
     client: reqwest::Client,
     api_key: Option<String>,
     record_bodies: bool,
+    capture_prompts: bool,
     default_run_id: Option<String>,
     // Calls that failed (HTTP >= 400 or unreachable upstream), shared with ProxyHandle.
     error_calls: Arc<AtomicU64>,
@@ -70,6 +71,7 @@ struct LlmCallRecord {
     run_id: Option<String>,
     upstream_base: String,
     model: Option<String>,
+    prompt: Option<String>,
     status: u16,
     duration_ms: u128,
     source_precision: &'static str,
@@ -240,15 +242,30 @@ fn build_state(
         .build()
         .map_err(|err| err.to_string())?;
 
+    let capture_prompts = record_bodies || config_capture_prompts(&root);
     Ok(Arc::new(ProxyState {
         upstream_base,
         ledger_root: root,
         client,
         api_key,
         record_bodies,
+        capture_prompts,
         default_run_id,
         error_calls,
     }))
+}
+
+/// Honor privacy.capture_prompts from AgentLedger.toml; prompts are captured
+/// by default when the config is absent or silent (recorded bodies contain
+/// the prompt anyway, so record_bodies always implies capture).
+fn config_capture_prompts(root: &Path) -> bool {
+    let Ok(raw) = fs::read_to_string(root.join("AgentLedger.toml")) else {
+        return true;
+    };
+    raw.parse::<toml::Value>()
+        .ok()
+        .and_then(|config| config.get("privacy")?.get("capture_prompts")?.as_bool())
+        .unwrap_or(true)
 }
 
 fn proxy_router(state: Arc<ProxyState>) -> Router {
@@ -339,6 +356,7 @@ async fn forward_openai_endpoint(
         request_json,
         response_json,
         state.record_bodies,
+        state.capture_prompts,
     );
     if let Err(err) = append_llm_call(&state.ledger_root, &record) {
         eprintln!("agentledger proxy record error: {err}");
@@ -373,13 +391,14 @@ fn stream_openai_response(
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<Bytes, std::io::Error>>(32);
     let record_bodies = state.record_bodies;
+    let capture_prompts = state.capture_prompts;
     let upstream_base = state.upstream_base.clone();
     let ledger_root = state.ledger_root.clone();
     let error_calls = Arc::clone(&state.error_calls);
     let status_code = status.as_u16();
 
     tokio::spawn(async move {
-        let mut collector = SseCollector::new(started, record_bodies);
+        let mut collector = SseCollector::new(started, record_bodies, capture_prompts);
         let mut upstream = response.bytes_stream();
         let mut client_connected = true;
         while let Some(item) = upstream.next().await {
@@ -433,6 +452,7 @@ fn stream_openai_response(
 struct SseCollector {
     started: Instant,
     record_bodies: bool,
+    capture_prompts: bool,
     line_buffer: Vec<u8>,
     ttft_ms: Option<u128>,
     last_output_ms: Option<u128>,
@@ -443,10 +463,11 @@ struct SseCollector {
 }
 
 impl SseCollector {
-    fn new(started: Instant, record_bodies: bool) -> Self {
+    fn new(started: Instant, record_bodies: bool, capture_prompts: bool) -> Self {
         Self {
             started,
             record_bodies,
+            capture_prompts,
             line_buffer: Vec::new(),
             ttft_ms: None,
             last_output_ms: None,
@@ -585,6 +606,10 @@ impl SseCollector {
             run_id,
             upstream_base: upstream_base.to_string(),
             model,
+            prompt: self
+                .capture_prompts
+                .then(|| extract_prompt(request_json))
+                .flatten(),
             status,
             duration_ms,
             source_precision,
@@ -720,6 +745,7 @@ fn build_record(
     request_json: Option<Value>,
     response_json: Option<Value>,
     record_bodies: bool,
+    capture_prompts: bool,
 ) -> LlmCallRecord {
     let model = request_json
         .as_ref()
@@ -748,6 +774,9 @@ fn build_record(
         run_id,
         upstream_base: upstream_base.to_string(),
         model,
+        prompt: capture_prompts
+            .then(|| extract_prompt(request_json.as_ref()))
+            .flatten(),
         status,
         duration_ms,
         source_precision: "exact",
@@ -755,6 +784,57 @@ fn build_record(
         request_body: record_bodies.then(|| request_json.clone()).flatten(),
         response_body: record_bodies.then(|| response_json.clone()).flatten(),
         metrics,
+    }
+}
+
+const PROMPT_PREVIEW_CHARS: usize = 2000;
+
+/// Best-effort extraction of the user prompt from an OpenAI-compatible
+/// request body: chat `messages`, responses-API `input`, or legacy `prompt`.
+pub(crate) fn extract_prompt(request_json: Option<&Value>) -> Option<String> {
+    let body = request_json?;
+    let text = last_user_content(body.get("messages"))
+        .or_else(|| last_user_content(body.get("input")))
+        .or_else(|| body.get("input").and_then(content_text))
+        .or_else(|| body.get("prompt").and_then(content_text))?;
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(truncate_chars(text, PROMPT_PREVIEW_CHARS))
+}
+
+fn last_user_content(messages: Option<&Value>) -> Option<String> {
+    messages?
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .and_then(|message| message.get("content"))
+        .and_then(content_text)
+}
+
+/// Message content is either a plain string or an array of typed parts.
+fn content_text(content: &Value) -> Option<String> {
+    if let Some(text) = content.as_str() {
+        return Some(text.to_string());
+    }
+    let text = content
+        .as_array()?
+        .iter()
+        .filter_map(|part| {
+            part.as_str()
+                .or_else(|| part.get("text").and_then(Value::as_str))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
+}
+
+fn truncate_chars(text: &str, limit: usize) -> String {
+    match text.char_indices().nth(limit) {
+        Some((idx, _)) => format!("{}…", &text[..idx]),
+        None => text.to_string(),
     }
 }
 
@@ -845,7 +925,7 @@ mod tests {
     use axum::http::header;
 
     fn collector() -> SseCollector {
-        SseCollector::new(Instant::now(), true)
+        SseCollector::new(Instant::now(), true, true)
     }
 
     #[test]
@@ -868,6 +948,61 @@ mod tests {
         assert_eq!(extract_run_id(&headers), Some("run-42".to_string()));
         headers.insert("x-agentledger-run-id", "   ".parse().unwrap());
         assert_eq!(extract_run_id(&headers), None);
+    }
+
+    #[test]
+    fn extract_prompt_reads_chat_messages_and_variants() {
+        // Dernier message user, contenu chaîne.
+        let chat = serde_json::json!({
+            "messages": [
+                { "role": "system", "content": "tu es concis" },
+                { "role": "user", "content": "première question" },
+                { "role": "assistant", "content": "réponse" },
+                { "role": "user", "content": "  Dis bonjour  " }
+            ]
+        });
+        assert_eq!(extract_prompt(Some(&chat)), Some("Dis bonjour".to_string()));
+
+        // Contenu en parties typées.
+        let parts = serde_json::json!({
+            "messages": [{ "role": "user", "content": [
+                { "type": "text", "text": "regarde cette image" },
+                { "type": "image_url", "image_url": { "url": "data:..." } },
+                { "type": "text", "text": "et décris-la" }
+            ]}]
+        });
+        assert_eq!(
+            extract_prompt(Some(&parts)),
+            Some("regarde cette image\net décris-la".to_string())
+        );
+
+        // API responses: input chaîne, puis legacy prompt.
+        let responses = serde_json::json!({ "input": "compte à rebours" });
+        assert_eq!(
+            extract_prompt(Some(&responses)),
+            Some("compte à rebours".to_string())
+        );
+        let legacy = serde_json::json!({ "prompt": "complète-moi" });
+        assert_eq!(
+            extract_prompt(Some(&legacy)),
+            Some("complète-moi".to_string())
+        );
+
+        // Rien d'exploitable.
+        assert_eq!(extract_prompt(None), None);
+        assert_eq!(
+            extract_prompt(Some(&serde_json::json!({ "messages": [] }))),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_prompt_truncates_long_prompts() {
+        let long = "é".repeat(PROMPT_PREVIEW_CHARS + 50);
+        let body = serde_json::json!({ "messages": [{ "role": "user", "content": long }] });
+        let prompt = extract_prompt(Some(&body)).expect("prompt");
+        assert_eq!(prompt.chars().count(), PROMPT_PREVIEW_CHARS + 1);
+        assert!(prompt.ends_with('…'));
     }
 
     #[test]
@@ -971,7 +1106,7 @@ mod tests {
 
     #[test]
     fn sse_collector_finish_estimates_tokens_without_usage() {
-        let mut collector = SseCollector::new(Instant::now(), false);
+        let mut collector = SseCollector::new(Instant::now(), false, false);
         collector.observe(
             concat!(
                 "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
